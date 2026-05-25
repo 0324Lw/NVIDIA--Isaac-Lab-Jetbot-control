@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Build
+build/
+dist/
+
+# Logs / outputs
+logs/
+runs/
+outputs/
+wandb/
+tensorboard/
+
+# Checkpoints / heavy files
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.onnx
+
+# Datasets / generated artifacts
+*.npz
+*.npy
+*.pkl
+
+# Local config
+configs/local_paths.yaml
+configs/*.local.yaml
+windows_paths.local.json
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

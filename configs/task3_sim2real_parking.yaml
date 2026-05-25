@@ -1,0 +1,38 @@
+task:
+  name: "diff_drive_task3_sim2real_parking"
+  robot: "Jetbot / two-wheel differential-drive UGV"
+  project_type: "educational Sim2Real parking baseline"
+  description: >
+    Task3 trains a two-wheel differential-drive robot to drive through a short
+    mixed-material track with low speed bumps and park inside a U-shaped parking
+    spot. The world layer provides conservative fixed geometry assets and GPU
+    tensors for Sim2Real domain randomization, LiDAR processing, risk features,
+    events, and privileged features.
+
+world:
+  track_length: 10.0
+  track_width: 3.0
+  materials:
+    - asphalt_start
+    - ice
+    - carpet
+    - asphalt_park
+  speed_bumps: 4
+  parking_spot: "U-shaped 3-wall parking slot"
+  lidar_pool_bins: 36
+  risk_feature_dim: 10
+  privileged_feature_dim: 38
+
+conservative_spawn:
+  enabled: true
+  description: >
+    Floors, lane walls, speed bumps, and parking walls are spawned manually into
+    /World/envs/env_0 first. Then speed-bump top sections and parking walls are
+    registered using RigidObjectCfg prim_path patterns. Geometry is nominal and
+    fixed; randomization is stored in GPU buffers.
+
+notes:
+  - "This file is a readable task summary."
+  - "The authoritative parameters are defined in task3_world.py."
+  - "Task3 world uses Isaac Lab asset APIs and must be imported after AppLauncher in tests."
+  - "Training must use the unified TRUE skrl PPO framework later."

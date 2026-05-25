@@ -1,0 +1,6 @@
+project_root: "/home/lw/diff_drive_ugv_isaaclab_rl"
+isaaclab_root: "/home/lw/IsaacLab"
+python_executable: "python"
+logs_root: "./logs"
+checkpoints_root: "./checkpoints"
+assets_root: "./assets"

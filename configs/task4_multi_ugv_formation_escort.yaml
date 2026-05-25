@@ -1,0 +1,35 @@
+task:
+  name: "diff_drive_task4_multi_ugv_formation_escort"
+  robot: "4 x Jetbot / two-wheel differential-drive UGV"
+  project_type: "educational multi-agent CTDE / MAPPO baseline"
+  description: >
+    Task4 trains four differential-drive UGVs to escort a virtual formation
+    center to a team goal while maintaining Diamond / Wedge / Line formations,
+    avoiding static obstacles, and passing through a narrow gate.
+
+world:
+  arena_length: 18.0
+  arena_width: 12.0
+  num_agents: 4
+  max_static_obstacles: 8
+  formation_types:
+    - diamond
+    - wedge
+    - line
+  lidar_pool_bins: 48
+  risk_feature_dim: 16
+  privileged_feature_dim: 96
+
+conservative_spawn:
+  enabled: true
+  description: >
+    Floors, arena walls, static obstacles, and gate walls are manually spawned
+    into /World/envs/env_0. Obstacles and gate walls are then registered using
+    RigidObjectCfg prim_path patterns. Reset moves obstacle and gate prims
+    with write_root_state_to_sim; geometry collider sizes remain nominal.
+
+notes:
+  - "This file is a readable task summary."
+  - "The authoritative parameters are defined in task4_world.py."
+  - "Task4 world uses Isaac Lab asset APIs and must be imported after AppLauncher in tests."
+  - "Training must use the unified TRUE skrl PPO / MAPPO-style framework later."

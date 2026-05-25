@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diff-drive-ugv-isaaclab-rl"
+version = "0.1.0"
+description = "NVIDIA Isaac Lab Diff-Drive UGV / Jetbot reinforcement learning baselines"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]

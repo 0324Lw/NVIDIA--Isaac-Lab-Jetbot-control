@@ -1,0 +1,31 @@
+task:
+  name: "diff_drive_task1_multi_waypoint_navigation"
+  robot: "Jetbot / two-wheel differential-drive UGV"
+  project_type: "educational pure-RL baseline"
+  description: >
+    Task1 trains a two-wheel differential-drive robot to navigate through
+    multiple randomly sampled waypoints on flat ground. The policy controls
+    normalized left/right wheel velocity commands.
+
+spaces:
+  action_dim: 2
+  single_obs_dim: 12
+  frame_stack: 3
+  actor_obs_dim: 36
+
+control:
+  type: "left_right_wheel_velocity"
+  policy_dt: "sim_dt * decimation"
+  action_smoothing: true
+
+scene:
+  ground: true
+  dome_light: true
+  robot_asset: "NVIDIA Isaac Jetbot USD"
+  env_spacing: 7.0
+
+notes:
+  - "This file is a lightweight readable task summary."
+  - "The authoritative parameters are defined in task1_config.py."
+  - "Training must use the unified TRUE skrl PPO framework later."
+  - "Large logs, checkpoints, videos, and temporary files should not be committed."

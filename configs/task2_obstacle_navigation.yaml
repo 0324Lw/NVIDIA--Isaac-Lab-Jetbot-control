@@ -1,0 +1,33 @@
+task:
+  name: "diff_drive_task2_obstacle_navigation"
+  robot: "Jetbot / two-wheel differential-drive UGV"
+  project_type: "educational pure-RL obstacle navigation baseline"
+  description: >
+    Task2 trains a two-wheel differential-drive robot to navigate from a sampled
+    start position to a sampled goal while avoiding static and dynamic analytic
+    obstacles. The world is generated as GPU tensors and does not create obstacle
+    prims in Isaac Sim.
+
+world:
+  coordinate: "env local xy"
+  arena_size: 50.0
+  max_static_obs: 20
+  max_dynamic_obs: 5
+  num_lidar_rays: 72
+  lidar_max_distance: 10.0
+  risk_features_dim: 8
+
+curriculum:
+  stages: 6
+  stage0: "short distance, no obstacles"
+  stage1: "few static obstacles"
+  stage2: "medium static obstacles"
+  stage3: "static + few dynamic obstacles"
+  stage4: "longer distance + more obstacles"
+  stage5: "full large-scene challenge"
+
+notes:
+  - "This is an analytic world layer only."
+  - "task2_env.py should convert local xy to Isaac world xy using env origins."
+  - "No AppLauncher is required for task2_world.py or task2_world_test.py."
+  - "Training must use the unified TRUE skrl PPO framework later."

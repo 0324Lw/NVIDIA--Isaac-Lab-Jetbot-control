@@ -1,0 +1,5 @@
+platform: windows_3090
+device: cuda:0
+default_num_envs_smoke: 512
+default_num_envs_full: 2048
+notes: "Use for RTX 3090 / 3090 Ti larger-scale training after smoke validation."

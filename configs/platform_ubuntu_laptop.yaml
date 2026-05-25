@@ -1,0 +1,5 @@
+platform: ubuntu_laptop
+device: cuda:0
+default_num_envs_smoke: 512
+default_num_envs_laptop: 128
+notes: "Use for local smoke tests and low-parallel training."
