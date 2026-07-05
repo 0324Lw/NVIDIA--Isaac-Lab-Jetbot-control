@@ -17,7 +17,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Diff-Drive UGV / Jetbot Task2 Analytic Obstacle Navigation Env Test")
+parser = argparse.ArgumentParser(description="Diff-Drive UGV Task2 Analytic Obstacle Navigation Env Test")
 parser.add_argument("--num-envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=3000)
 parser.add_argument("--seed", type=int, default=42)
@@ -140,7 +140,7 @@ def print_summary_table(summary: Dict[str, Dict[str, float]]) -> None:
         return
 
     print("\n" + "=" * 188)
-    print(" " * 48 + "Diff-Drive UGV / Jetbot Task2 Env 统计报告")
+    print(" " * 48 + "Diff-Drive UGV Task2 Env 统计报告")
     print("=" * 188)
     print(
         f"{'metric':<82} | {'mean':>11} | {'var':>11} | {'min':>11} | "
@@ -236,7 +236,22 @@ def check_obs(env: DiffDriveTask2Env, obs: torch.Tensor) -> None:
     )
 
 
+
 def get_single_obs_slices(cfg: Task2Config):
+    """返回 Task2 单帧观测切片。
+
+    前 14 维必须严格遵守 core navigation：
+        0      goal_dist_norm
+        1:3    goal_x_body_norm, goal_y_body_norm
+        3:5    sin_heading_error, cos_heading_error
+        5:8    body_vx, body_vy, body_wz
+        8      target_speed_norm
+        9      last_forward_throttle
+        10     last_turn_command
+        11     action_delta_forward
+        12     action_delta_turn
+        13     progress_ema
+    """
     s = {}
     idx = 0
 
@@ -245,15 +260,44 @@ def get_single_obs_slices(cfg: Task2Config):
     s["heading"] = slice(idx, idx + 2); idx += 2
     s["vel_obs"] = slice(idx, idx + 3); idx += 3
     s["target_speed"] = slice(idx, idx + 1); idx += 1
-    s["actions"] = slice(idx, idx + 2); idx += 2
-    s["action_delta"] = slice(idx, idx + 2); idx += 2
+    s["last_forward_turn"] = slice(idx, idx + 2); idx += 2
+    s["action_delta_forward_turn"] = slice(idx, idx + 2); idx += 2
     s["progress_ema"] = slice(idx, idx + 1); idx += 1
+
+    # Backward-compatible aliases for tests that only care about dimensions.
+    s["actions"] = s["last_forward_turn"]
+    s["action_delta"] = s["action_delta_forward_turn"]
+
+    s["core_nav"] = slice(0, idx)
     s["lidar"] = slice(idx, idx + cfg.world_cfg.num_lidar_rays); idx += cfg.world_cfg.num_lidar_rays
     s["lidar_delta"] = slice(idx, idx + cfg.world_cfg.num_lidar_rays); idx += cfg.world_cfg.num_lidar_rays
     s["risk"] = slice(idx, idx + 8); idx += 8
 
+    assert s["core_nav"].stop == int(getattr(cfg, "core_single_obs_dim", 14)), (
+        f"core navigation 维度错误: {s['core_nav'].stop} != {getattr(cfg, 'core_single_obs_dim', 14)}"
+    )
     assert idx == int(cfg.single_obs_dim), f"单帧 obs slice 总维度错误: {idx} != {cfg.single_obs_dim}"
     return s
+
+
+def set_env_to_stage(env: DiffDriveTask2Env, stage_idx: int, eps: float = 1e-6) -> None:
+    """按 cfg.world_cfg.stage_thresholds 动态设置 env.global_steps。
+
+    不再在测试中硬编码 0.08/0.20/0.38 等旧课程阈值，避免课程配置
+    更新后白盒测试失效。
+    """
+    thresholds = list(env.cfg.world_cfg.stage_thresholds)
+    assert 0 <= stage_idx < len(thresholds), f"stage_idx 越界: {stage_idx}"
+    k = float(thresholds[stage_idx]) + (eps if stage_idx > 0 else 0.0)
+    k = min(max(k, 0.0), 1.0)
+    env.global_steps = int(k * env.cfg.world_cfg.curriculum_total_steps)
+
+
+def stage_k(env: DiffDriveTask2Env, stage_idx: int, eps: float = 1e-6) -> float:
+    thresholds = list(env.cfg.world_cfg.stage_thresholds)
+    assert 0 <= stage_idx < len(thresholds), f"stage_idx 越界: {stage_idx}"
+    k = float(thresholds[stage_idx]) + (eps if stage_idx > 0 else 0.0)
+    return min(max(k, 0.0), 1.0)
 
 
 def run_fixed_action(env: DiffDriveTask2Env, action_tensor: torch.Tensor, steps: int = 80):
@@ -296,7 +340,6 @@ def run_fixed_action(env: DiffDriveTask2Env, action_tensor: torch.Tensor, steps:
 
     return delta_pos, delta_yaw, obs, reward, terminated, truncated, info
 
-
 def check_project_files() -> None:
     heading("[测试 0] Task2 工程文件存在性检查")
 
@@ -315,8 +358,9 @@ def check_project_files() -> None:
         print_ok(str(path.relative_to(PROJECT_ROOT)))
 
 
+
 def check_config() -> None:
-    heading("[测试 1] Task2Config 基础配置检测")
+    heading("[测试 1] Task2Config 基础配置与协议检测")
 
     cfg = Task2Config()
     cfg.validate()
@@ -327,14 +371,23 @@ def check_config() -> None:
     assert cfg.num_observations == 498
     assert cfg.world_cfg.num_lidar_rays == 72
 
+    assert getattr(cfg, "action_protocol", "forward_throttle_turn") == "forward_throttle_turn"
+    assert int(getattr(cfg, "core_single_obs_dim", 14)) == 14
+    assert int(getattr(cfg, "stacked_core_obs_dim", 42)) == 42
+    assert int(getattr(cfg, "extra_single_obs_dim", 152)) == 152
+    assert int(getattr(cfg, "stacked_extra_obs_dim", 456)) == 456
+
     print_ok(f"num_actions = {cfg.num_actions}")
     print_ok(f"single_obs_dim = {cfg.single_obs_dim}")
     print_ok(f"frame_stack = {cfg.frame_stack}")
     print_ok(f"num_observations = {cfg.num_observations}")
+    print_ok(f"core navigation single dim = {getattr(cfg, 'core_single_obs_dim', 14)}")
+    print_ok(f"core navigation stacked dim = {getattr(cfg, 'stacked_core_obs_dim', 42)}")
+    print_ok(f"Task2 extra stacked dim = {getattr(cfg, 'stacked_extra_obs_dim', 456)}")
+    print_ok(f"action_protocol = {getattr(cfg, 'action_protocol', 'forward_throttle_turn')}")
     print_ok(f"world.num_lidar_rays = {cfg.world_cfg.num_lidar_rays}")
     print_ok(f"max_episode_length = {cfg.max_episode_length}")
     print_ok("Task2Config 基础配置正常")
-
 
 def check_env_init(cfg: Task2Config) -> DiffDriveTask2Env:
     heading("[测试 2] DiffDriveTask2Env 初始化 / 名称映射 / 空间维度检测")
@@ -352,7 +405,7 @@ def check_env_init(cfg: Task2Config) -> DiffDriveTask2Env:
     print_ok(f"max_episode_length = {env.cfg.max_episode_length}")
     print_ok(f"wheel_joint_ids = {env.wheel_joint_ids}")
 
-    assert env.robot.num_joints >= 2, f"Jetbot 关节数量异常: {env.robot.num_joints}"
+    assert env.robot.num_joints >= 2, f"关节数量异常: {env.robot.num_joints}"
     assert env.num_actions == 2
     assert env.cfg.single_obs_dim == 166
     assert env.num_observations == env.cfg.frame_stack * env.cfg.single_obs_dim
@@ -436,7 +489,7 @@ def test_stage_sampling(env: DiffDriveTask2Env):
     cfg = env.cfg
     old_steps = int(env.global_steps)
     rows = []
-    stage_ks = [0.0, 0.08, 0.20, 0.38, 0.60, 0.80]
+    stage_ks = [float(k) + (1e-6 if i > 0 else 0.0) for i, k in enumerate(cfg.world_cfg.stage_thresholds)]
 
     for expected_stage, k in enumerate(stage_ks):
         env.global_steps = int(k * cfg.world_cfg.curriculum_total_steps)
@@ -489,10 +542,11 @@ def test_stage_sampling(env: DiffDriveTask2Env):
     print_ok("不同课程阶段 reset 采样正常")
 
 
-def test_obs_slices(env: DiffDriveTask2Env):
-    heading("[测试 6] observation 切片与数值范围检测")
 
-    env.global_steps = int(0.38 * env.cfg.world_cfg.curriculum_total_steps)
+def test_obs_slices(env: DiffDriveTask2Env):
+    heading("[测试 6] core navigation / obstacle observation 切片与数值范围检测")
+
+    set_env_to_stage(env, stage_idx=0)
     obs, _ = env.reset()
     check_obs(env, obs)
 
@@ -501,13 +555,14 @@ def test_obs_slices(env: DiffDriveTask2Env):
     s = get_single_obs_slices(env.cfg)
 
     parts = {
+        "core_nav": last_frame[:, s["core_nav"]],
         "goal_dist_norm": last_frame[:, s["goal_dist_norm"]],
         "goal_xy_body": last_frame[:, s["goal_xy_body"]],
         "heading": last_frame[:, s["heading"]],
         "vel_obs": last_frame[:, s["vel_obs"]],
         "target_speed": last_frame[:, s["target_speed"]],
-        "actions": last_frame[:, s["actions"]],
-        "action_delta": last_frame[:, s["action_delta"]],
+        "last_forward_turn": last_frame[:, s["last_forward_turn"]],
+        "action_delta_forward_turn": last_frame[:, s["action_delta_forward_turn"]],
         "progress_ema": last_frame[:, s["progress_ema"]],
         "lidar": last_frame[:, s["lidar"]],
         "lidar_delta": last_frame[:, s["lidar_delta"]],
@@ -517,12 +572,14 @@ def test_obs_slices(env: DiffDriveTask2Env):
     for name, x in parts.items():
         assert_finite_tensor(name, x)
 
+    check_shape("core navigation", parts["core_nav"], (env.num_envs, 14))
     check_shape("lidar", parts["lidar"], (env.num_envs, env.cfg.world_cfg.num_lidar_rays))
     check_shape("lidar_delta", parts["lidar_delta"], (env.num_envs, env.cfg.world_cfg.num_lidar_rays))
     check_shape("risk", parts["risk"], (env.num_envs, 8))
 
     assert parts["heading"].abs().max().item() <= 1.0 + 1e-5
-    assert parts["actions"].abs().max().item() <= 1.0 + 1e-5
+    assert parts["last_forward_turn"].abs().max().item() <= 1.0 + 1e-5
+    assert parts["action_delta_forward_turn"].abs().max().item() <= 2.0 + 1e-5
     assert parts["lidar"].min().item() >= 0.0
     assert parts["lidar"].max().item() <= 1.0 + 1e-5
     assert parts["lidar_delta"].min().item() >= -1.0 - 1e-5
@@ -532,6 +589,7 @@ def test_obs_slices(env: DiffDriveTask2Env):
 
     print_ok(f"obs shape = {tuple(obs.shape)}")
     print_ok(f"last_frame range = {last_frame.min().item():+.6f} ~ {last_frame.max().item():+.6f}")
+    print_ok(f"core navigation range = {parts['core_nav'].min().item():+.6f} ~ {parts['core_nav'].max().item():+.6f}")
     print_ok(f"lidar range = {parts['lidar'].min().item():.6f} ~ {parts['lidar'].max().item():.6f}")
     print_ok(f"risk range = {parts['risk'].min().item():.6f} ~ {parts['risk'].max().item():.6f}")
 
@@ -539,7 +597,7 @@ def test_obs_slices(env: DiffDriveTask2Env):
 def test_step_return_structure(env: DiffDriveTask2Env):
     heading("[测试 7] 向量化 step 返回结构与 info 字典检测")
 
-    env.global_steps = 0
+    set_env_to_stage(env, stage_idx=0)
     obs, _ = env.reset()
 
     action = torch.rand((env.num_envs, env.num_actions), device=env.device) * 0.4 - 0.2
@@ -555,19 +613,13 @@ def test_step_return_structure(env: DiffDriveTask2Env):
         assert group in info, f"info 缺少分组: {group}"
 
     required_reward_keys = [
-        "R_Progress",
-        "R_Goal_Speed",
-        "R_Heading",
-        "R_Turn_To_Goal",
-        "R_Front_Clearance",
-        "P_Collision_Risk",
-        "P_TTC",
-        "P_Boundary",
-        "P_Spin",
-        "P_Stuck",
+        "R_Goal_Progress_Velocity",
+        "R_Heading_Improve",
+        "R_Target_Speed",
+        "R_Aligned_Motion",
+        "P_Misaligned_Forward",
+        "P_Safety_Proximity",
         "P_Action_Smooth",
-        "P_Action_Mag",
-        "P_Wheel_Speed",
         "Step",
         "Continuous",
         "Event",
@@ -575,6 +627,32 @@ def test_step_return_structure(env: DiffDriveTask2Env):
     ]
     for key in required_reward_keys:
         assert key in info["reward_components"], f"reward_components 缺少 {key}"
+
+    removed_reward_keys = [
+        "P_Bad_Turn",
+        "P_Lateral_Vel",
+        "P_Spin_In_Place",
+        "R_Progress",
+        "R_Goal_Speed",
+        "R_Goal_Speed_Forward",
+        "R_Goal_Speed_Gaussian",
+        "R_Heading",
+        "R_Turn_To_Goal",
+        "R_Front_Clearance",
+        "R_Speed_Factor",
+        "P_Under_Speed",
+        "P_Low_Speed_Aligned",
+        "P_Backtrack",
+        "P_Collision_Risk",
+        "P_TTC",
+        "P_Boundary",
+        "P_Spin",
+        "P_Stuck",
+        "P_Action_Mag",
+        "P_Wheel_Speed",
+    ]
+    for key in removed_reward_keys:
+        assert key not in info["reward_components"], f"reward_components 不应再输出旧字段 {key}"
 
     required_event_keys = [
         "Success_Rate",
@@ -589,6 +667,10 @@ def test_step_return_structure(env: DiffDriveTask2Env):
         "Episode_Out_Of_Bounds_Rate",
         "Episode_Timeout_Rate",
         "Episode_Done_Count",
+        "Current_Window_Success_Rate",
+        "Current_Window_Collision_Rate",
+        "Current_Window_Out_Of_Bounds_Rate",
+        "Current_Window_Timeout_Rate",
     ]
     for key in required_event_keys:
         assert key in info["events"], f"events 缺少 {key}"
@@ -599,16 +681,39 @@ def test_step_return_structure(env: DiffDriveTask2Env):
         "Target_Speed",
         "Goal_Dist",
         "Progress",
+        "Progress_EMA",
+        "Progress_Velocity",
+        "Progress_Velocity_EMA",
         "Goal_Aligned_Speed",
+        "Speed_Ratio",
+        "Signed_Speed_Ratio",
         "Heading_Error",
+        "Heading_Cos",
+        "Heading_Improve",
+        "Safety_Risk",
+        "Safety_Signed_Distance",
+        "Static_Signed_Distance",
+        "Path_Corridor_Signed_Distance",
+        "Dynamic_Predicted_Signed_Distance",
         "Lidar_Min",
         "Risk_Front",
         "Static_Count",
         "Dynamic_Count",
+        "Action_Forward_Throttle",
+        "Action_Turn",
+        "Forward_Command_Norm",
+        "Turn_Command_Norm",
+        "Left_Wheel_Target_Norm",
+        "Right_Wheel_Target_Norm",
+        "Positive_Linear_Command_Rate",
         "Episode_Length",
     ]
     for key in required_tel_keys:
         assert key in info["telemetry"], f"telemetry 缺少 {key}"
+
+    removed_tel_keys = ["Action_Left", "Action_Right", "Spin_In_Place_Ratio", "Bad_Turn_Ratio"]
+    for key in removed_tel_keys:
+        assert key not in info["telemetry"], f"telemetry 不应再输出旧/误导字段 {key}"
 
     print_ok(f"reward mean = {reward.mean().item():+.6f}")
     print_ok(f"reward min/max = {reward.min().item():+.6f} / {reward.max().item():+.6f}")
@@ -618,42 +723,68 @@ def test_step_return_structure(env: DiffDriveTask2Env):
 
 
 def test_action_direction(env: DiffDriveTask2Env):
-    heading("[测试 8] 动作方向白盒测试：前进 / 后退 / 原地旋转")
+    heading("[测试 8] Action protocol 动作方向白盒测试：前进 / 最小前进 / 差速转向")
 
     steps = 80
+    set_env_to_stage(env, stage_idx=0)
 
-    delta_forward, yaw_forward, *_ = run_fixed_action(env, torch.tensor([1.0, 1.0]), steps=steps)
+    # Action protocol:
+    #   action[0] = forward_throttle
+    #   action[1] = turn_command
+    # 因此 [1, 0] 是前进，[−1, 0] 是最小正向速度，不是倒车；
+    # [−1, ±1] 用于低速/原地附近差速转向。
+    delta_forward, yaw_forward, _, _, _, _, info_forward = run_fixed_action(env, torch.tensor([1.0, 0.0]), steps=steps)
     forward_x = delta_forward[:, 0]
 
-    delta_backward, yaw_backward, *_ = run_fixed_action(env, torch.tensor([-1.0, -1.0]), steps=steps)
-    backward_x = delta_backward[:, 0]
+    delta_min_forward, yaw_min_forward, _, _, _, _, info_min_forward = run_fixed_action(env, torch.tensor([-1.0, 0.0]), steps=steps)
+    min_forward_x = delta_min_forward[:, 0]
 
-    delta_turn, yaw_turn, *_ = run_fixed_action(env, torch.tensor([1.0, -1.0]), steps=steps)
-    turn_xy = torch.norm(delta_turn, dim=-1)
+    delta_turn_left, yaw_turn_left, _, _, _, _, info_turn_left = run_fixed_action(env, torch.tensor([-1.0, 1.0]), steps=steps)
+    delta_turn_right, yaw_turn_right, _, _, _, _, info_turn_right = run_fixed_action(env, torch.tensor([-1.0, -1.0]), steps=steps)
+    turn_xy = 0.5 * (torch.norm(delta_turn_left, dim=-1) + torch.norm(delta_turn_right, dim=-1))
 
-    print_stats("forward delta x", forward_x)
-    print_stats("backward delta x", backward_x)
-    print_stats("turn delta yaw", yaw_turn)
+    print_stats("forward [1,0] delta x", forward_x)
+    print_stats("min-forward [-1,0] delta x", min_forward_x)
+    print_stats("turn-left [-1,1] delta yaw", yaw_turn_left)
+    print_stats("turn-right [-1,-1] delta yaw", yaw_turn_right)
     print_stats("turn xy movement", turn_xy)
 
+    tel_fwd = info_forward.get("telemetry", {})
+    tel_min = info_min_forward.get("telemetry", {})
+    tel_left = info_turn_left.get("telemetry", {})
+    tel_right = info_turn_right.get("telemetry", {})
+
+    assert tel_fwd.get("Forward_Command_Norm", 0.0) > 0.50, "[1,0] 应产生明显非负 forward command"
+    assert abs(tel_fwd.get("Turn_Command_Norm", 999.0)) < 0.05, "[1,0] 不应产生明显 turn command"
+    assert tel_min.get("Forward_Command_Norm", -1.0) >= -1e-6, "[-1,0] 的 forward command 不应为负"
+    assert tel_min.get("Positive_Linear_Command_Rate", 0.0) > 0.99, "线速度命令应保持非负"
+    assert abs(tel_left.get("Turn_Command_Norm", 0.0)) > 0.10, "[-1,1] 应产生明显转向命令"
+    assert abs(tel_right.get("Turn_Command_Norm", 0.0)) > 0.10, "[-1,-1] 应产生明显转向命令"
+    assert tel_left.get("Turn_Command_Norm", 0.0) * tel_right.get("Turn_Command_Norm", 0.0) < 0.0, (
+        "左右转测试的 turn command 应方向相反"
+    )
+
     forward_ok = forward_x.mean().item() > 0.05
-    backward_ok = backward_x.mean().item() < -0.05
-    turn_ok = yaw_turn.abs().mean().item() > 0.10
+    min_forward_no_reverse = min_forward_x.mean().item() > -0.05
+    turn_ok = yaw_turn_left.abs().mean().item() > 0.10 and yaw_turn_right.abs().mean().item() > 0.10
+    turn_opposite = yaw_turn_left.mean().item() * yaw_turn_right.mean().item() < 0.0
 
     if args_cli.strict_action_test:
-        assert forward_ok, "action=[1,1] 没有让车明显前进。请检查 wheel signs。"
-        assert backward_ok, "action=[-1,-1] 没有让车明显后退。请检查 wheel signs。"
-        assert turn_ok, "action=[1,-1] 没有让车明显原地转向。请检查 wheel signs 或 joint 顺序。"
+        assert forward_ok, "action=[1,0] 没有让车沿 +x 明显前进。请检查 wheel signs。"
+        assert min_forward_no_reverse, "action=[-1,0] 出现明显整体倒车。请检查 ActionProtocol 映射。"
+        assert turn_ok, "action=[-1,±1] 没有让车明显转向。请检查 wheel signs 或 joint 顺序。"
+        assert turn_opposite, "左右转 yaw 方向没有相反。请检查 turn sign。"
     else:
         if not forward_ok:
-            print_warn("action=[1,1] 没有明显前进。若训练变慢，请调整 left_wheel_sign/right_wheel_sign。")
-        if not backward_ok:
-            print_warn("action=[-1,-1] 没有明显后退。若训练变慢，请调整 wheel signs。")
+            print_warn("action=[1,0] 没有沿 +x 明显前进。若训练变慢，请调整 left_wheel_sign/right_wheel_sign。")
+        if not min_forward_no_reverse:
+            print_warn("action=[-1,0] 出现明显整体倒车；这不符合 Task1/Task2 的 forward-only 语义。")
         if not turn_ok:
-            print_warn("action=[1,-1] 没有明显转向。若训练变慢，请检查 wheel signs 或 joint 顺序。")
+            print_warn("action=[-1,±1] 没有明显转向。若训练变慢，请检查 wheel signs 或 joint 顺序。")
+        if not turn_opposite:
+            print_warn("左右转 yaw 方向没有相反。若训练转向混乱，请检查 turn sign。")
 
-    print_ok("动作方向测试完成")
-
+    print_ok("Action protocol 动作方向测试完成")
 
 def test_success_event(env: DiffDriveTask2Env):
     heading("[测试 9] 手动触发 success 事件检测")
@@ -690,11 +821,11 @@ def test_static_collision_event(env: DiffDriveTask2Env):
     heading("[测试 10] 手动触发 static collision 事件检测")
 
     cfg = env.cfg
-    env.global_steps = int(0.08 * cfg.world_cfg.curriculum_total_steps)
+    set_env_to_stage(env, stage_idx=2)
     env.reset()
 
     env_ids = torch.arange(min(64, env.num_envs), dtype=torch.long, device=env.device)
-    assert env.world.static_mask[env_ids, 0].all().item(), "Stage1 第一个静态障碍未激活"
+    assert env.world.static_mask[env_ids, 0].all().item(), "Stage2 第一个静态障碍未激活"
 
     obstacle_xy = env.world.static_pos[env_ids, 0, :]
 
@@ -722,11 +853,11 @@ def test_dynamic_collision_event(env: DiffDriveTask2Env):
     heading("[测试 11] 手动触发 dynamic collision 事件检测")
 
     cfg = env.cfg
-    env.global_steps = int(0.38 * cfg.world_cfg.curriculum_total_steps)
+    set_env_to_stage(env, stage_idx=4)
     env.reset()
 
     env_ids = torch.arange(min(64, env.num_envs), dtype=torch.long, device=env.device)
-    assert env.world.dynamic_mask[env_ids, 0].all().item(), "Stage3 第一个动态障碍未激活"
+    assert env.world.dynamic_mask[env_ids, 0].all().item(), "Stage4 第一个动态障碍未激活"
 
     obstacle_xy = env.world.dynamic_pos[env_ids, 0, :]
 
@@ -800,12 +931,16 @@ def test_timeout_event(env: DiffDriveTask2Env):
 def test_dynamic_obstacle_integration(env: DiffDriveTask2Env):
     heading("[测试 14] 动态障碍物与 env.step 集成检测")
 
-    cfg = env.cfg
-    env.global_steps = int(0.38 * cfg.world_cfg.curriculum_total_steps)
+    # 当前 default 配置下，Stage 4 才开始生成动态障碍物。
+    # 不再写死 0.38，直接从 cfg.world_cfg.stage_thresholds[3] 进入 Stage 4。
+    set_env_to_stage(env, stage_idx=4)
     env.reset()
 
+    stage_mean = int(round(env.world.env_stage.float().mean().item()))
+    assert stage_mean == 4, f"未进入 Stage4，当前 stage={stage_mean}"
+
     dyn_count = env.world.dynamic_mask.float().sum(dim=-1)
-    assert dyn_count.mean().item() > 0.0, "Stage3 应生成动态障碍物"
+    assert dyn_count.mean().item() > 0.0, "Stage4 应生成动态障碍物"
 
     pos0 = env.world.dynamic_pos.clone()
     zero_action = torch.zeros((env.num_envs, env.num_actions), device=env.device)
@@ -820,20 +955,23 @@ def test_dynamic_obstacle_integration(env: DiffDriveTask2Env):
     moved = torch.norm(pos1 - pos0, dim=-1)
     moved_valid = moved[env.world.dynamic_mask]
 
+    assert moved_valid.numel() > 0, "Stage4 没有有效动态障碍物样本"
     assert moved_valid.mean().item() > 0.01, "env.step 后动态障碍物没有移动"
 
     check_obs(env, obs)
     assert_finite_tensor("reward", reward)
 
     print_stats("dynamic obstacle movement", moved_valid)
+    print_ok(f"Stage = {stage_mean}")
     print_ok(f"Dynamic_Count = {info['telemetry']['Dynamic_Count']:.6f}")
     print_ok("动态障碍物 env.step 集成正常")
 
 
-def test_reward_direction(env: DiffDriveTask2Env):
-    heading("[测试 15] progress reward 正负方向检测")
 
-    env.global_steps = 0
+def test_reward_direction(env: DiffDriveTask2Env):
+    heading("[测试 15] simplified reward 方向与防刷分检测")
+
+    set_env_to_stage(env, stage_idx=0)
     env.reset()
 
     env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
@@ -843,15 +981,36 @@ def test_reward_direction(env: DiffDriveTask2Env):
     env.world.goal_pos[:] = torch.tensor([5.0, 0.0], dtype=torch.float32, device=env.device)
     env.world.env_target_speed[:] = 0.5
 
+    # 1) 对准目标但不移动：目标速度、期望速度和朝向改善都不应长期刷分。
     force_root_local_pose(
         env,
         env_ids=env_ids,
         local_xy=torch.zeros((env.num_envs, 2), device=env.device),
         height=env.cfg.spawn_height,
         yaw=torch.zeros(env.num_envs, device=env.device),
+        zero_vel=True,
     )
     env.last_goal_dist[:] = torch.norm(env.world.goal_pos - env._root_pos_local(), dim=-1)
+    env.last_heading_error_abs[:] = 0.0
+    reward_static, _, _, info_static = env._compute_rewards_and_dones(
+        pre_goal_dist=torch.full((env.num_envs,), 5.0, device=env.device)
+    )
 
+    assert abs(info_static["telemetry"]["Progress"]) < 1e-6, "静止时 Progress 应接近 0"
+    assert abs(info_static["reward_components"]["R_Goal_Progress_Velocity"]) < 1e-5, (
+        "静止时 R_Goal_Progress_Velocity 不应给正收益"
+    )
+    assert info_static["reward_components"]["R_Target_Speed"] < 1e-5, (
+        "静止时 R_Target_Speed 不应给正收益"
+    )
+    assert abs(info_static["reward_components"]["R_Heading_Improve"]) < 1e-5, (
+        "静止且朝向未改善时 R_Heading_Improve 不应刷分"
+    )
+    assert abs(info_static["reward_components"]["R_Aligned_Motion"]) < 1e-5, (
+        "静止时 R_Aligned_Motion 不应给正收益"
+    )
+
+    # 2) 朝 goal 前进，Progress 与主任务奖励应为正，且优于远离 goal。
     force_root_local_pose(
         env,
         env_ids=env_ids,
@@ -859,6 +1018,7 @@ def test_reward_direction(env: DiffDriveTask2Env):
         height=env.cfg.spawn_height,
         yaw=torch.zeros(env.num_envs, device=env.device),
     )
+    env.last_heading_error_abs[:] = 0.0
     reward_fwd, _, _, info_fwd = env._compute_rewards_and_dones(
         pre_goal_dist=torch.full((env.num_envs,), 5.0, device=env.device)
     )
@@ -870,23 +1030,41 @@ def test_reward_direction(env: DiffDriveTask2Env):
         height=env.cfg.spawn_height,
         yaw=torch.zeros(env.num_envs, device=env.device),
     )
+    env.last_heading_error_abs[:] = 0.0
     reward_back, _, _, info_back = env._compute_rewards_and_dones(
         pre_goal_dist=torch.full((env.num_envs,), 5.0, device=env.device)
     )
 
     assert info_fwd["telemetry"]["Progress"] > 0.0, "朝 goal 前进时 Progress 应为正"
     assert info_back["telemetry"]["Progress"] < 0.0, "远离 goal 时 Progress 应为负"
+    assert info_fwd["reward_components"]["R_Goal_Progress_Velocity"] > 0.0, (
+        "朝 goal 前进时 R_Goal_Progress_Velocity 应为正"
+    )
+    assert info_back["reward_components"]["R_Goal_Progress_Velocity"] < 0.0, (
+        "远离 goal 时 R_Goal_Progress_Velocity 应为负"
+    )
     assert reward_fwd.mean().item() > reward_back.mean().item(), "朝 goal 前进的奖励应大于远离 goal"
 
+    print_ok(
+        f"static progress = {info_static['telemetry']['Progress']:+.6f}, "
+        f"R_GPV = {info_static['reward_components']['R_Goal_Progress_Velocity']:+.6f}, "
+        f"R_Target = {info_static['reward_components']['R_Target_Speed']:+.6f}, "
+        f"R_HeadImprove = {info_static['reward_components']['R_Heading_Improve']:+.6f}, "
+        f"R_Aligned = {info_static['reward_components']['R_Aligned_Motion']:+.6f}, "
+        f"reward = {reward_static.mean().item():+.6f}"
+    )
     print_ok(f"forward progress = {info_fwd['telemetry']['Progress']:+.6f}, reward = {reward_fwd.mean().item():+.6f}")
     print_ok(f"backward progress = {info_back['telemetry']['Progress']:+.6f}, reward = {reward_back.mean().item():+.6f}")
-    print_ok("progress reward 方向正确")
-
+    print_ok("simplified reward 方向与防刷分检测通过")
 
 def random_rollout(env: DiffDriveTask2Env):
     heading(f"[测试 16] 随机策略运行 {args_cli.steps} 步，收集奖励组件 / 事件 / 遥测")
 
-    env.global_steps = int(float(args_cli.rollout_k) * env.cfg.world_cfg.curriculum_total_steps)
+    # rollout_k 仍然允许命令行指定，但这里增加边界保护和 stage 打印。
+    rollout_k = float(args_cli.rollout_k)
+    rollout_k = min(max(rollout_k, 0.0), 1.0)
+    env.global_steps = int(rollout_k * env.cfg.world_cfg.curriculum_total_steps)
+
     obs, _ = env.reset()
 
     records = []
@@ -896,6 +1074,9 @@ def random_rollout(env: DiffDriveTask2Env):
     total_timeout = 0
 
     start_time = time.time()
+
+    rollout_stage = int(round(env.world.env_stage.float().mean().item()))
+    print_ok(f"rollout_k = {rollout_k:.6f}, rollout stage = {rollout_stage}")
 
     for step in range(int(args_cli.steps)):
         actions = torch.rand((env.num_envs, env.num_actions), device=env.device) * 2.0 - 1.0
@@ -935,9 +1116,9 @@ def random_rollout(env: DiffDriveTask2Env):
                 f"Coll={ev.get('Collision_Rate', 0.0):.4f} | "
                 f"OOB={ev.get('Out_Of_Bounds_Rate', 0.0):.4f} | "
                 f"Timeout={ev.get('Timeout_Rate', 0.0):.4f} | "
-                f"R_Prog={rew.get('R_Progress', 0.0):+.3f} | "
-                f"R_Goal={rew.get('R_Goal_Speed', 0.0):+.3f} | "
-                f"P_Risk={rew.get('P_Collision_Risk', 0.0):+.3f}",
+                f"R_GPV={rew.get('R_Goal_Progress_Velocity', 0.0):+.3f} | "
+                f"R_Target={rew.get('R_Target_Speed', 0.0):+.3f} | "
+                f"P_Safety={rew.get('P_Safety_Proximity', 0.0):+.3f}",
                 flush=True,
             )
 
@@ -966,7 +1147,7 @@ def random_rollout(env: DiffDriveTask2Env):
     heading("[测试 17] 奖励组件 / 事件 / 遥测统计报告")
     print_summary_table(summarize_records(records))
 
-    print("Diff-Drive UGV / Jetbot Task2 training pre-check guide:")
+    print("Diff-Drive UGV Task2 training pre-check guide:")
     print("1. obs 应为 498 维，即 3 帧 × 166 维。")
     print("2. Stage / Static_Count / Dynamic_Count 应随 rollout_k 对应课程变化。")
     print("3. Lidar_Min / Risk_Front / Front_Clearance 应能正常进入 telemetry。")
@@ -976,7 +1157,7 @@ def random_rollout(env: DiffDriveTask2Env):
 
 
 def run_tests() -> None:
-    heading("🚀 Diff-Drive UGV / Jetbot Task2 Analytic Obstacle Navigation Env 全量测试启动")
+    heading("🚀 Diff-Drive UGV Task2 Analytic Obstacle Navigation Env 全量测试启动")
 
     torch.manual_seed(int(args_cli.seed))
     np.random.seed(int(args_cli.seed))
@@ -1021,10 +1202,10 @@ def run_tests() -> None:
         test_reward_direction(env)
         random_rollout(env)
 
-        heading("Diff-Drive UGV / Jetbot Task2 环境测试全部通过")
+        heading("Diff-Drive UGV Task2 环境测试全部通过")
 
     except Exception as exc:
-        print("\n❌ Diff-Drive UGV / Jetbot Task2 环境测试失败：")
+        print("\n❌ Diff-Drive UGV Task2 环境测试失败：")
         print(type(exc).__name__, ":", exc)
         raise
 
@@ -1034,6 +1215,7 @@ def run_tests() -> None:
                 env.close()
             except Exception:
                 pass
+
 
 
 if __name__ == "__main__":

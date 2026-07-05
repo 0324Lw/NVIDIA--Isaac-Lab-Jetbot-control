@@ -1,0 +1,12 @@
+Patch: fix Task1 reset command diagnostic buffer lower-bound invariant
+
+Modified files:
+- src/diff_drive_rl/tasks/task1/task1_env.py
+
+Scope:
+- Fixes Task1 environment long-run white-box test failure where auto-reset envs set forward_command_norm to zero.
+- Does not modify reward logic, observation dimension, done logic, world/curriculum, Task2/Task3/Task4, or scripts.
+
+Validation run:
+- python -m compileall -q src tests
+- PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/core/test_diff_drive_kinematics.py tests/core/test_task1_action_protocol_equivalence.py tests/export/test_policy_io.py

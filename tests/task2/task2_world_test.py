@@ -15,6 +15,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from diff_drive_rl.tasks.task2.task2_config import make_default_task2_world_cfg
 from diff_drive_rl.tasks.task2.task2_world import Task2WorldConfig, Task2WorldManager
 
 
@@ -22,7 +23,7 @@ from diff_drive_rl.tasks.task2.task2_world import Task2WorldConfig, Task2WorldMa
 # Args
 # ======================================================================
 
-parser = argparse.ArgumentParser(description="Diff-Drive UGV / Jetbot Task2 Analytic World Test")
+parser = argparse.ArgumentParser(description="Diff-Drive UGV Task2 Analytic World Test")
 parser.add_argument("--num-envs", type=int, default=4096)
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--seed", type=int, default=42)
@@ -116,7 +117,7 @@ def print_summary_table(summary: Dict[str, Dict[str, float]]) -> None:
         return
 
     print("\n" + "=" * 188)
-    print(" " * 52 + "Diff-Drive UGV / Jetbot Task2 Analytic World 统计报告")
+    print(" " * 52 + "Diff-Drive UGV Task2 Analytic World 统计报告")
     print("=" * 188)
     print(
         f"{'metric':<82} | {'mean':>11} | {'var':>11} | {'min':>11} | "
@@ -158,6 +159,18 @@ def disable_all_obstacles(world: Task2WorldManager) -> None:
     world.dynamic_vel[:] = 0.0
 
 
+
+
+def stage_k(cfg: Task2WorldConfig, stage_idx: int, eps: float = 1e-6) -> float:
+    thresholds = list(cfg.stage_thresholds)
+    assert 0 <= stage_idx < len(thresholds), f"stage_idx 越界: {stage_idx}"
+    k = float(thresholds[stage_idx]) + (eps if stage_idx > 0 else 0.0)
+    return min(max(k, 0.0), 1.0)
+
+
+def stage_steps(cfg: Task2WorldConfig, stage_idx: int, eps: float = 1e-6) -> int:
+    return int(stage_k(cfg, stage_idx, eps=eps) * cfg.curriculum_total_steps)
+
 def combined_obstacles(world: Task2WorldManager) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pos = torch.cat([world.static_pos, world.dynamic_pos], dim=1)
     radius = torch.cat([world.static_radius, world.dynamic_radius], dim=1)
@@ -193,13 +206,25 @@ def test_config(world: Task2WorldManager) -> None:
     print_ok("Task2WorldConfig 基础配置正常")
 
 
+
 def test_curriculum_mapping(world: Task2WorldManager) -> None:
     heading("[测试 1] 课程阶段映射检测")
 
     cfg = world.cfg
     rows = []
 
-    ks = [0.0, 0.04, 0.08, 0.19, 0.20, 0.37, 0.38, 0.59, 0.60, 0.79, 0.80, 1.0]
+    # 动态使用 cfg.stage_thresholds，避免测试和 Task2Config 的课程阈值脱节。
+    ks = [0.0]
+    for i, th in enumerate(cfg.stage_thresholds):
+        k = float(th) + (1e-6 if i > 0 else 0.0)
+        if 0.0 <= k <= 1.0:
+            ks.append(k)
+        if i + 1 < len(cfg.stage_thresholds):
+            mid = 0.5 * (float(th) + float(cfg.stage_thresholds[i + 1]))
+            if 0.0 <= mid <= 1.0:
+                ks.append(mid)
+    ks.append(1.0)
+    ks = sorted(set(round(float(k), 8) for k in ks))
 
     for k in ks:
         stage = world.stage_from_progress(k)
@@ -241,7 +266,7 @@ def test_stage_reset_sampling(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    stage_ks = [0.0, 0.08, 0.20, 0.38, 0.60, 0.80]
+    stage_ks = [stage_k(cfg, i) for i in range(cfg.num_stages)]
     rows: List[Dict[str, float]] = []
 
     for expected_stage, k in enumerate(stage_ks):
@@ -254,6 +279,7 @@ def test_stage_reset_sampling(world: Task2WorldManager) -> None:
         goal_dist = torch.norm(world.goal_pos - world.start_pos, dim=-1)
         static_count = world.static_mask.float().sum(dim=-1)
         dynamic_count = world.dynamic_mask.float().sum(dim=-1)
+        path_corridor_signed = world.static_path_corridor_signed_distance()
 
         gmin, gmax = cfg.goal_dist_ranges[expected_stage]
         smin, smax = cfg.static_count_ranges[expected_stage]
@@ -271,6 +297,15 @@ def test_stage_reset_sampling(world: Task2WorldManager) -> None:
 
         assert world.env_target_speed.min().item() >= vmin - 1e-4
         assert world.env_target_speed.max().item() <= vmax + 1e-4
+
+        if static_count.max().item() > 0:
+            finite_path = path_corridor_signed[path_corridor_signed < 1e5]
+            assert finite_path.numel() > 0, "存在静态障碍时 path corridor signed distance 应为有限值"
+            assert finite_path.min().item() > -0.50, "课程采样不应把静态障碍直接压到 nominal path 上"
+            if expected_stage == 1:
+                assert finite_path.mean().item() > 0.70, "Stage1 应为极弱障碍过渡，不应形成强 corridor"
+            if expected_stage == 2:
+                assert finite_path.mean().item() > 0.30, "Stage2 单障碍 light corridor 仍需保留通行余量"
 
         half = cfg.half_extent
         assert world.start_pos.abs().max().item() <= half + 1e-4
@@ -300,21 +335,22 @@ def test_stage_reset_sampling(world: Task2WorldManager) -> None:
                 "DynamicMean": dynamic_count.mean().item(),
                 "DynamicMin": dynamic_count.min().item(),
                 "DynamicMax": dynamic_count.max().item(),
+                "PathCorridorMean": path_corridor_signed[path_corridor_signed < 1e5].mean().item() if (path_corridor_signed < 1e5).any() else 1.0e6,
                 "TargetSpeedMean": world.env_target_speed.mean().item(),
             }
         )
 
-    print(f"{'K':>6} | {'Stage':>5} | {'GoalMean':>9} | {'GoalMin':>8} | {'GoalMax':>8} | {'StaticMean':>10} | {'DynamicMean':>11} | {'SpeedMean':>10}")
+    print(f"{'K':>6} | {'Stage':>5} | {'GoalMean':>9} | {'GoalMin':>8} | {'GoalMax':>8} | {'StaticMean':>10} | {'DynamicMean':>11} | {'PathCorr':>9} | {'SpeedMean':>10}")
     print("-" * 92)
     for row in rows:
         print(
             f"{row['K']:>6.2f} | {int(row['Stage']):>5d} | {row['GoalDistMean']:>9.3f} | "
             f"{row['GoalDistMin']:>8.3f} | {row['GoalDistMax']:>8.3f} | "
-            f"{row['StaticMean']:>10.3f} | {row['DynamicMean']:>11.3f} | {row['TargetSpeedMean']:>10.3f}"
+            f"{row['StaticMean']:>10.3f} | {row['DynamicMean']:>11.3f} | "
+            f"{row['PathCorridorMean']:>9.3f} | {row['TargetSpeedMean']:>10.3f}"
         )
 
     print_ok("各课程阶段 reset 采样正常")
-
 
 def test_obstacle_safety(world: Task2WorldManager) -> None:
     heading("[测试 3] 障碍物安全区 / 边界 / 间距检测")
@@ -323,7 +359,7 @@ def test_obstacle_safety(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    world.reset(env_ids, global_steps=int(0.80 * cfg.curriculum_total_steps))
+    world.reset(env_ids, global_steps=stage_steps(cfg, cfg.num_stages - 1))
 
     half = cfg.half_extent
 
@@ -363,7 +399,7 @@ def test_obstacle_safety(world: Task2WorldManager) -> None:
             active_pair = active_pair & upper.unsqueeze(0)
 
             if active_pair.any():
-                min_required = rad_pair + cfg.min_obs_spacing + cfg.robot_radius
+                min_required = rad_pair + cfg.min_passage_width
                 sep_margin = dist_pair - min_required
                 active_sep_margin = sep_margin[active_pair]
 
@@ -533,7 +569,7 @@ def test_event_detection(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    world.reset(env_ids, global_steps=int(0.60 * cfg.curriculum_total_steps))
+    world.reset(env_ids, global_steps=stage_steps(cfg, 4))
     disable_all_obstacles(world)
 
     root_goal = world.goal_pos.clone()
@@ -581,10 +617,16 @@ def test_dynamic_obstacle_motion(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    world.reset(env_ids, global_steps=int(0.60 * cfg.curriculum_total_steps))
+    world.reset(env_ids, global_steps=stage_steps(cfg, 4))
 
     dyn_count = world.dynamic_mask.float().sum(dim=-1)
-    assert dyn_count.mean().item() > 0.0, "Stage4 应有动态障碍物"
+    assert dyn_count.mean().item() > 0.0, "高阶段应有动态障碍物"
+
+    dyn_speed = torch.norm(world.dynamic_vel, dim=-1)
+    target_limit = world.env_target_speed.unsqueeze(-1).expand_as(world.dynamic_mask.float()) * float(cfg.dynamic_speed_target_ratio) + 1e-5
+    assert torch.where(world.dynamic_mask, dyn_speed <= target_limit, torch.ones_like(world.dynamic_mask)).all().item(), (
+        "动态障碍物速度应低于无人车期望速度的一定比例"
+    )
 
     pos0 = world.dynamic_pos.clone()
 
@@ -621,7 +663,7 @@ def test_navigation_features(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    world.reset(env_ids, global_steps=int(0.38 * cfg.curriculum_total_steps))
+    world.reset(env_ids, global_steps=stage_steps(cfg, 4))
 
     root = world.start_pos.clone()
     yaw = torch.zeros(E, dtype=torch.float32, device=world.device)
@@ -696,7 +738,7 @@ def test_random_world_rollout(world: Task2WorldManager) -> None:
     E = world.num_envs
     env_ids = torch.arange(E, dtype=torch.long, device=world.device)
 
-    world.reset(env_ids, global_steps=int(0.80 * cfg.curriculum_total_steps))
+    world.reset(env_ids, global_steps=stage_steps(cfg, cfg.num_stages - 1))
 
     records: List[Dict[str, float]] = []
     start_time = time.time()
@@ -774,7 +816,7 @@ def test_random_world_rollout(world: Task2WorldManager) -> None:
 # ======================================================================
 
 def run_tests() -> None:
-    heading("Diff-Drive UGV / Jetbot Task2 Analytic World 全量测试启动")
+    heading("Diff-Drive UGV Task2 Analytic World 全量测试启动")
 
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -789,7 +831,7 @@ def run_tests() -> None:
         args.num_envs = min(int(args.num_envs), 512)
         args.steps = min(int(args.steps), 300)
 
-    cfg = Task2WorldConfig()
+    cfg = make_default_task2_world_cfg()
     cfg.validate()
 
     world = Task2WorldManager(
@@ -820,7 +862,7 @@ def run_tests() -> None:
     print("5. 随机 rollout 中 collision / OOB 可以非零，因为 root 是随机采样的。")
     print("6. 世界层通过后，再进入 task2_env.py 编写。")
 
-    heading("Diff-Drive UGV / Jetbot Task2 Analytic World 测试全部通过")
+    heading("Diff-Drive UGV Task2 Analytic World 测试全部通过")
 
 
 if __name__ == "__main__":

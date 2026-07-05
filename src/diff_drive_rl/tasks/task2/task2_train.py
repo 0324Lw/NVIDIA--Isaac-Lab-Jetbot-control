@@ -35,17 +35,19 @@ if str(SRC_ROOT) not in sys.path:
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Train Diff-Drive UGV / Jetbot Task2 with TRUE skrl PPO")
+parser = argparse.ArgumentParser(description="Train Diff-Drive UGV Task2 with skrl PPO")
 
 # Runtime
-parser.add_argument("--total-env-steps", type=int, default=250_000_000)
+parser.add_argument("--total-env-steps", type=int, default=50_000_000)
 parser.add_argument("--save-freq-env-steps", type=int, default=10_000_000)
 parser.add_argument("--num-envs", type=int, default=4096)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--resume", type=str, default="", help="Optional skrl checkpoint or final_checkpoint directory")
+parser.add_argument("--resume", type=str, default="", help="Optional Task2 skrl checkpoint or final_checkpoint directory")
+parser.add_argument("--task1-core-checkpoint", type=str, default="", help="Optional Task1 checkpoint/model path used to initialize Task2 policy.core_encoder")
 
 # Curriculum / env
 parser.add_argument("--start-k", type=float, default=0.0)
+parser.add_argument("--force-stage", type=int, default=0, help="Fix reset sampling to a curriculum stage. -1 means normal global-step curriculum")
 parser.add_argument("--max-episode-length-s", type=float, default=80.0)
 
 # PPO
@@ -53,9 +55,9 @@ parser.add_argument("--rollouts", type=int, default=64)
 parser.add_argument("--learning-epochs", type=int, default=4)
 parser.add_argument("--mini-batches", type=int, default=8)
 
-parser.add_argument("--lr", type=float, default=2.5e-4)
+parser.add_argument("--lr", type=float, default=1.0e-4)
 parser.add_argument("--min-lr", type=float, default=5e-5)
-parser.add_argument("--max-lr", type=float, default=5e-4)
+parser.add_argument("--max-lr", type=float, default=2.5e-4)
 
 parser.add_argument("--gamma", type=float, default=0.995)
 parser.add_argument("--gae-lambda", type=float, default=0.95)
@@ -77,9 +79,16 @@ parser.add_argument("--hard-kl-stop", type=float, default=0.120)
 # Logging
 parser.add_argument("--log-root", type=str, default=str(PROJECT_ROOT / "logs" / "task2"))
 parser.add_argument("--run-name", type=str, default="")
-parser.add_argument("--summary-interval", type=int, default=1)
+parser.add_argument("--summary-interval", type=int, default=10)
 parser.add_argument("--skrl-write-interval", type=int, default=1_000_000)
 parser.add_argument("--skrl-checkpoint-interval", type=int, default=0)
+
+# Stage-wise checkpoint selection.  Final checkpoints are still saved, but Task2
+# hand-off should use best_balanced / best_efficiency / stage_pass checkpoints.
+parser.add_argument("--disable-best-checkpoints", action="store_true", help="Disable metric-based best checkpoint saving")
+parser.add_argument("--best-checkpoint-min-interval-env-steps", type=int, default=500_000)
+parser.add_argument("--stage-pass-patience", type=int, default=3)
+parser.add_argument("--stage-pass-early-stop", action="store_true", help="Stop training once stage pass criteria are met for patience summaries")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
@@ -220,6 +229,124 @@ def current_lr(agent) -> float:
     return float("nan")
 
 
+def clamp01(x: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(x)))
+    except Exception:
+        return 0.0
+
+
+def current_stage_index(env_cfg: Task2Config, flat: Dict[str, float]) -> int:
+    raw_stage = flat.get("telemetry/Stage", float(env_cfg.force_stage if env_cfg.force_stage >= 0 else 0))
+    idx = int(round(float(raw_stage)))
+    return max(0, min(idx, int(env_cfg.world_cfg.num_stages) - 1))
+
+
+def stage_threshold(env_cfg: Task2Config, name: str, stage: int) -> float:
+    values = getattr(env_cfg, name)
+    stage = max(0, min(int(stage), len(values) - 1))
+    return float(values[stage])
+
+
+def compute_balanced_score(env_cfg: Task2Config, flat: Dict[str, float]) -> Dict[str, float]:
+    stage = current_stage_index(env_cfg, flat)
+    success = clamp01(flat.get("events/Episode_Success_Rate", flat.get("events/Current_Window_Success_Rate", 0.0)))
+    collision = clamp01(flat.get("events/Episode_Collision_Rate", flat.get("events/Current_Window_Collision_Rate", 0.0)))
+    timeout = clamp01(flat.get("events/Episode_Timeout_Rate", flat.get("events/Current_Window_Timeout_Rate", 0.0)))
+    oob = clamp01(flat.get("events/Episode_Out_Of_Bounds_Rate", flat.get("events/Current_Window_Out_Of_Bounds_Rate", 0.0)))
+    progress_velocity = max(0.0, float(flat.get("telemetry/Progress_Velocity", flat.get("telemetry/Current_Window_Goal_Aligned_Speed", 0.0))))
+    target_speed = max(0.05, float(flat.get("telemetry/Target_Speed", 0.5)))
+    progress_norm = clamp01(progress_velocity / target_speed)
+    heading_cos = clamp01((float(flat.get("telemetry/Heading_Cos", 0.0)) + 1.0) * 0.5)
+    speed_ratio = clamp01(float(flat.get("telemetry/Speed_Ratio", 0.0)))
+
+    score = (
+        float(env_cfg.best_score_success_weight) * success
+        - float(env_cfg.best_score_collision_weight) * collision
+        - float(env_cfg.best_score_timeout_weight) * timeout
+        - float(env_cfg.best_score_out_of_bounds_weight) * oob
+        + float(env_cfg.best_score_progress_weight) * progress_norm
+        + float(env_cfg.best_score_heading_weight) * heading_cos
+        + float(env_cfg.best_score_speed_weight) * speed_ratio
+    )
+
+    efficiency_score = (
+        success
+        - 0.30 * collision
+        - 0.30 * timeout
+        - 0.20 * oob
+        + 0.35 * progress_norm
+        + 0.35 * heading_cos
+        + 0.15 * speed_ratio
+    )
+
+    success_score = success - 0.50 * collision - 0.50 * timeout - 0.30 * oob
+
+    return {
+        "stage": float(stage),
+        "success": success,
+        "collision": collision,
+        "timeout": timeout,
+        "out_of_bounds": oob,
+        "progress_velocity": progress_velocity,
+        "progress_norm": progress_norm,
+        "heading_cos": float(flat.get("telemetry/Heading_Cos", 0.0)),
+        "heading_score": heading_cos,
+        "speed_ratio": speed_ratio,
+        "balanced_score": float(score),
+        "efficiency_score": float(efficiency_score),
+        "success_score": float(success_score),
+    }
+
+
+def stage_passed(env_cfg: Task2Config, flat: Dict[str, float]) -> bool:
+    stage = current_stage_index(env_cfg, flat)
+    success = float(flat.get("events/Episode_Success_Rate", 0.0))
+    timeout = float(flat.get("events/Episode_Timeout_Rate", 1.0))
+    collision = float(flat.get("events/Episode_Collision_Rate", 1.0))
+    oob = float(flat.get("events/Episode_Out_Of_Bounds_Rate", 1.0))
+    progress_velocity = float(flat.get("telemetry/Progress_Velocity", 0.0))
+    heading_cos = float(flat.get("telemetry/Heading_Cos", -1.0))
+    speed_ratio = float(flat.get("telemetry/Speed_Ratio", 0.0))
+
+    return (
+        success >= stage_threshold(env_cfg, "stage_pass_success_rate", stage)
+        and timeout <= stage_threshold(env_cfg, "stage_pass_timeout_rate", stage)
+        and collision <= stage_threshold(env_cfg, "stage_pass_collision_rate", stage)
+        and oob <= stage_threshold(env_cfg, "stage_pass_out_of_bounds_rate", stage)
+        and progress_velocity >= stage_threshold(env_cfg, "stage_pass_progress_velocity", stage)
+        and heading_cos >= stage_threshold(env_cfg, "stage_pass_heading_cos", stage)
+        and speed_ratio >= stage_threshold(env_cfg, "stage_pass_speed_ratio", stage)
+    )
+
+
+def model_param_vector(model: nn.Module) -> torch.Tensor:
+    """返回 CPU 上的参数向量，用于核查 PPO 是否真实更新。"""
+
+    with torch.no_grad():
+        return torch.cat([p.detach().float().view(-1).cpu() for p in model.parameters()])
+
+
+def model_param_norm(model: nn.Module) -> float:
+    vec = model_param_vector(model)
+    return float(torch.norm(vec).item())
+
+
+def resolve_resume_metadata(path: str) -> str:
+    if not path:
+        return ""
+    p = Path(path).expanduser().resolve()
+    candidates = []
+    if p.is_file():
+        candidates += [p.parent / "task2_train_metadata.pt", p.parent.parent / "task2_train_metadata.pt"]
+    elif p.is_dir():
+        candidates += [p / "task2_train_metadata.pt", p / "final_checkpoint" / "task2_train_metadata.pt"]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return ""
+
+
 def make_run_name() -> str:
     run_name = args_cli.run_name.strip()
     if run_name:
@@ -314,6 +441,17 @@ class DiffDriveTask2SkrlWrapper(gym.Env):
 # ======================================================================
 
 class DiffDriveTask2Actor(GaussianMixin, Model):
+    """Modular actor for Task2.
+
+    Observation layout is 3 stacked frames. In each frame, the first 14 dims are
+    core navigation and the remaining 152 dims are Task2 obstacle perception. The
+    policy explicitly separates these two parts so Task1 can initialize only the
+    shared core_encoder.
+    """
+
+    core_single_dim = 14
+    frame_stack = 3
+
     def __init__(
         self,
         observation_space,
@@ -340,15 +478,37 @@ class DiffDriveTask2Actor(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.net = nn.Sequential(
-            nn.Linear(observation_space.shape[0], 512),
+        obs_dim = int(observation_space.shape[0])
+        if obs_dim % self.frame_stack != 0:
+            raise RuntimeError(f"Task2 obs_dim={obs_dim} is not divisible by frame_stack={self.frame_stack}")
+
+        self.single_obs_dim = obs_dim // self.frame_stack
+        self.extra_single_dim = self.single_obs_dim - self.core_single_dim
+        if self.extra_single_dim < 0:
+            raise RuntimeError(f"Task2 single_obs_dim={self.single_obs_dim} < CoreNav dim={self.core_single_dim}")
+
+        self.core_obs_dim = self.core_single_dim * self.frame_stack
+        self.extra_obs_dim = self.extra_single_dim * self.frame_stack
+
+        self.core_encoder = nn.Sequential(
+            nn.Linear(self.core_obs_dim, 128),
             nn.ELU(),
-            nn.Linear(512, 256),
+            nn.Linear(128, 128),
+            nn.ELU(),
+        )
+        self.extra_encoder = nn.Sequential(
+            nn.Linear(self.extra_obs_dim, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
-            nn.Linear(128, action_space.shape[0]),
         )
+        self.fusion_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+        )
+        self.mean_head = nn.Linear(128, action_space.shape[0])
 
         self.log_std_parameter = nn.Parameter(torch.full((action_space.shape[0],), float(init_log_std)))
         self.apply(self._init_weights)
@@ -359,13 +519,28 @@ class DiffDriveTask2Actor(GaussianMixin, Model):
             nn.init.orthogonal_(module.weight, gain=1.0)
             nn.init.constant_(module.bias, 0.0)
 
+    def _split_obs(self, states: torch.Tensor):
+        x = states.reshape(states.shape[0], self.frame_stack, self.single_obs_dim)
+        core = x[:, :, : self.core_single_dim].reshape(states.shape[0], self.core_obs_dim)
+        extra = x[:, :, self.core_single_dim :].reshape(states.shape[0], self.extra_obs_dim)
+        return core, extra
+
     def compute(self, inputs, role):
         states = inputs.get("observations", inputs.get("states"))
-        actions = self.net(states)
+        core_obs, extra_obs = self._split_obs(states)
+        core_latent = self.core_encoder(core_obs)
+        extra_latent = self.extra_encoder(extra_obs)
+        fused = self.fusion_head(torch.cat([core_latent, extra_latent], dim=-1))
+        actions = self.mean_head(fused)
         return actions, {"log_std": self.log_std_parameter}
 
 
 class DiffDriveTask2Critic(DeterministicMixin, Model):
+    """Modular critic using the same CoreNav / extra split as the actor."""
+
+    core_single_dim = 14
+    frame_stack = 3
+
     def __init__(self, observation_space, state_space, action_space, device):
         Model.__init__(
             self,
@@ -376,16 +551,41 @@ class DiffDriveTask2Critic(DeterministicMixin, Model):
         )
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.net = nn.Sequential(
-            nn.Linear(state_space.shape[0], 512),
+        state_dim = int(state_space.shape[0])
+        if state_dim % self.frame_stack != 0:
+            raise RuntimeError(f"Task2 state_dim={state_dim} is not divisible by frame_stack={self.frame_stack}")
+
+        self.single_obs_dim = state_dim // self.frame_stack
+        self.extra_single_dim = self.single_obs_dim - self.core_single_dim
+        self.core_obs_dim = self.core_single_dim * self.frame_stack
+        self.extra_obs_dim = self.extra_single_dim * self.frame_stack
+
+        self.core_encoder = nn.Sequential(
+            nn.Linear(self.core_obs_dim, 128),
             nn.ELU(),
-            nn.Linear(512, 256),
+            nn.Linear(128, 128),
+            nn.ELU(),
+        )
+        self.extra_encoder = nn.Sequential(
+            nn.Linear(self.extra_obs_dim, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
-            nn.Linear(128, 1),
         )
+        self.fusion_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+        )
+        self.value_head = nn.Linear(128, 1)
         self.apply(DiffDriveTask2Actor._init_weights)
+
+    def _split_obs(self, states: torch.Tensor):
+        x = states.reshape(states.shape[0], self.frame_stack, self.single_obs_dim)
+        core = x[:, :, : self.core_single_dim].reshape(states.shape[0], self.core_obs_dim)
+        extra = x[:, :, self.core_single_dim :].reshape(states.shape[0], self.extra_obs_dim)
+        return core, extra
 
     def compute(self, inputs, role):
         states = inputs.get("states", None)
@@ -393,7 +593,11 @@ class DiffDriveTask2Critic(DeterministicMixin, Model):
             states = inputs.get("observations", None)
         if states is None:
             raise RuntimeError("Critic received no states / observations.")
-        return self.net(states), {}
+        core_obs, extra_obs = self._split_obs(states)
+        core_latent = self.core_encoder(core_obs)
+        extra_latent = self.extra_encoder(extra_obs)
+        fused = self.fusion_head(torch.cat([core_latent, extra_latent], dim=-1))
+        return self.value_head(fused), {}
 
 
 # ======================================================================
@@ -586,13 +790,20 @@ def save_project_checkpoint(
             "env_steps": int(env_steps),
             "args": vars(args),
             "metadata": {
-                "robot": "Jetbot / two-wheel differential-drive UGV",
-                "task": "task2_analytic_obstacle_navigation",
+                "robot": "two-wheel differential-drive UGV",
+                "task": "task2_obstacle_navigation",
                 "algorithm": "skrl_PPO",
                 "uses_skrl": True,
                 "asymmetric_actor_critic": False,
                 "policy_input": "obs_3_frame_stack",
                 "critic_input": "same_as_policy",
+                "action_protocol": str(env_cfg.action_protocol),
+                "obs_protocol": str(env_cfg.obs_protocol),
+                "model_protocol": str(env_cfg.model_protocol),
+                "core_single_obs_dim": int(env_cfg.core_single_obs_dim),
+                "stacked_core_obs_dim": int(env_cfg.stacked_core_obs_dim),
+                "task_extra_single_obs_dim": int(env_cfg.task_extra_single_obs_dim),
+                "stacked_task_extra_obs_dim": int(env_cfg.stacked_task_extra_obs_dim),
                 "single_obs_dim": int(env_cfg.single_obs_dim),
                 "frame_stack": int(env_cfg.frame_stack),
                 "actor_obs_dim": int(env_cfg.num_observations),
@@ -602,8 +813,10 @@ def save_project_checkpoint(
                 "max_static_obs": int(env_cfg.world_cfg.max_static_obs),
                 "max_dynamic_obs": int(env_cfg.world_cfg.max_dynamic_obs),
                 "world": "analytic_gpu_world",
-                "control": "left_right_wheel_velocity",
-                "note": "TRUE skrl PPO checkpoint. Evaluation uses deterministic policy forward, not agent.act.",
+                "control": "forward_throttle_plus_turn_to_left_right_wheel_velocity",
+                "action_semantics": "action[0]=forward_throttle_nonnegative_with_stage_min_speed, action[1]=turn",
+                "transfer_note": "Task1 -> Task2 migration loads policy.core_encoder only; Task2 extra_encoder/fusion/head are task-specific.",
+                "note": "skrl PPO checkpoint. Evaluation uses deterministic policy forward, not agent.act.",
             },
         },
         eval_model_path,
@@ -616,17 +829,26 @@ def save_project_checkpoint(
             "uses_skrl": True,
             "env_steps": int(env_steps),
             "num_envs": int(env_cfg.num_envs),
+            "global_steps": int(getattr(env.env, "global_steps", env_steps)),
+            "force_stage": int(env_cfg.force_stage),
             "env_cfg": {
                 "num_observations": int(env_cfg.num_observations),
                 "single_obs_dim": int(env_cfg.single_obs_dim),
                 "frame_stack": int(env_cfg.frame_stack),
                 "num_actions": int(env_cfg.num_actions),
                 "max_episode_length": int(env_cfg.max_episode_length),
+                "action_protocol": str(env_cfg.action_protocol),
+                "obs_protocol": str(env_cfg.obs_protocol),
+                "model_protocol": str(env_cfg.model_protocol),
+                "core_single_obs_dim": int(env_cfg.core_single_obs_dim),
+                "stacked_core_obs_dim": int(env_cfg.stacked_core_obs_dim),
+                "task_extra_single_obs_dim": int(env_cfg.task_extra_single_obs_dim),
                 "world": {
                     "num_lidar_rays": int(env_cfg.world_cfg.num_lidar_rays),
                     "max_static_obs": int(env_cfg.world_cfg.max_static_obs),
                     "max_dynamic_obs": int(env_cfg.world_cfg.max_dynamic_obs),
                     "curriculum_total_steps": int(env_cfg.world_cfg.curriculum_total_steps),
+                    "force_stage": int(env_cfg.force_stage),
                 },
             },
         },
@@ -634,6 +856,77 @@ def save_project_checkpoint(
     )
 
     print(f"💾 [Diff-Drive Task2 skrl checkpoint] saved to: {directory}", flush=True)
+
+
+
+def _candidate_state_dicts(payload: Any):
+    """Yield tensor dictionaries from common checkpoint formats."""
+    if isinstance(payload, dict):
+        # Direct state_dict.
+        if any(torch.is_tensor(v) for v in payload.values()):
+            yield payload
+
+        for key in ["policy", "actor", "model", "state_dict"]:
+            value = payload.get(key, None)
+            if isinstance(value, dict):
+                yield from _candidate_state_dicts(value)
+
+        models = payload.get("models", None)
+        if isinstance(models, dict):
+            for value in models.values():
+                if isinstance(value, dict):
+                    yield from _candidate_state_dicts(value)
+
+
+def load_task1_core_encoder(policy: DiffDriveTask2Actor, checkpoint_path: str) -> bool:
+    """Load Task1 CoreNav encoder weights into Task2 policy.core_encoder.
+
+    This intentionally loads only the shared CoreNav encoder. Task2's obstacle
+    extra_encoder, fusion_head and action head remain Task2-specific.
+    """
+    if not checkpoint_path:
+        return False
+
+    path = Path(checkpoint_path).expanduser().resolve()
+    if path.is_dir():
+        for name in ["diff_drive_task1_model.pt", "diff_drive_task1_skrl_agent.pt", "agent.pt"]:
+            candidate = path / name
+            if candidate.exists():
+                path = candidate
+                break
+
+    if not path.exists():
+        print(f"[WARN] Task1 core checkpoint not found: {path}")
+        return False
+
+    payload = torch.load(str(path), map_location="cpu")
+    target_state = policy.core_encoder.state_dict()
+
+    for state in _candidate_state_dicts(payload):
+        core_state: Dict[str, torch.Tensor] = {}
+        for key, value in state.items():
+            if not torch.is_tensor(value):
+                continue
+            normalized = str(key)
+            if "core_encoder." not in normalized:
+                continue
+            suffix = normalized.split("core_encoder.", 1)[1]
+            if suffix in target_state and tuple(target_state[suffix].shape) == tuple(value.shape):
+                core_state[suffix] = value.detach().cpu()
+
+        if core_state:
+            missing, unexpected = policy.core_encoder.load_state_dict(core_state, strict=False)
+            loaded = sorted(core_state.keys())
+            print(f"[INFO] Loaded Task1 CoreNav encoder from: {path}")
+            print(f"[INFO] Loaded core_encoder tensors: {loaded}")
+            if missing:
+                print(f"[WARN] Missing core_encoder tensors after partial load: {list(missing)}")
+            if unexpected:
+                print(f"[WARN] Unexpected core_encoder tensors after partial load: {list(unexpected)}")
+            return True
+
+    print(f"[WARN] No compatible core_encoder weights found in Task1 checkpoint: {path}")
+    return False
 
 
 # ======================================================================
@@ -648,7 +941,7 @@ def main() -> None:
     os.makedirs(log_dir, exist_ok=True)
 
     print("\n" + "=" * 118)
-    print("🚀 Diff-Drive UGV / Jetbot Task2 Analytic Obstacle Navigation - TRUE skrl PPO Training")
+    print("🚀 Diff-Drive UGV Task2 Core Navigation + Obstacle Navigation - skrl PPO Training")
     print("=" * 118)
     print(f"[INFO] PROJECT_ROOT = {PROJECT_ROOT}")
     print(f"[INFO] log_root     = {log_dir}")
@@ -659,6 +952,7 @@ def main() -> None:
     env_cfg.num_envs = int(args_cli.num_envs)
     env_cfg.device = str(args_cli.device)
     env_cfg.seed = int(args_cli.seed)
+    env_cfg.force_stage = int(args_cli.force_stage)
     env_cfg.max_episode_length_s = float(args_cli.max_episode_length_s)
     env_cfg.print_debug_info = False
     env_cfg.validate()
@@ -670,6 +964,9 @@ def main() -> None:
 
     base_env = DiffDriveTask2Env(env_cfg)
     base_env.global_steps = int(initial_global_steps)
+    # __init__ 内已经做过一次 reset；start_k / force_stage 设置后需要重置一次，
+    # 确保首批 episode 就来自正确课程阶段。
+    base_env.reset()
 
     if initial_global_steps > 0:
         print(
@@ -677,6 +974,9 @@ def main() -> None:
             f"initial_global_steps={initial_global_steps:,}, "
             f"stage={base_env.world.stage_from_global_steps(initial_global_steps)}"
         )
+
+    if int(args_cli.force_stage) >= 0:
+        print(f"[INFO] force_stage={int(args_cli.force_stage)} enabled: all resets sample this stage")
 
     local_env = DiffDriveTask2SkrlWrapper(base_env)
     env = wrap_env(local_env, wrapper="isaaclab")
@@ -689,7 +989,11 @@ def main() -> None:
     print(f"  env.observation_space = {env.observation_space}")
     print(f"  env.state_space       = {env.state_space}")
     print(f"  env.action_space      = {env.action_space}")
+    print(f"  action_protocol       = {env_cfg.action_protocol}")
+    print(f"  obs_protocol          = {env_cfg.obs_protocol}")
+    print(f"  model_protocol        = {env_cfg.model_protocol}")
     print(f"  single_obs_dim        = {env_cfg.single_obs_dim}")
+    print(f"  core_single_obs_dim   = {env_cfg.core_single_obs_dim}")
     print(f"  frame_stack           = {env_cfg.frame_stack}")
     print(f"  policy input dim      = {env.observation_space.shape[0]}")
     print(f"  critic input dim      = {env.state_space.shape[0]}")
@@ -734,16 +1038,37 @@ def main() -> None:
         device=env.device,
     )
 
+    if str(args_cli.task1_core_checkpoint).strip() and not str(args_cli.resume).strip():
+        load_task1_core_encoder(models["policy"], str(args_cli.task1_core_checkpoint).strip())
+    elif str(args_cli.task1_core_checkpoint).strip() and str(args_cli.resume).strip():
+        print("[WARN] --resume is set, so full Task2 checkpoint loading takes precedence over --task1-core-checkpoint")
+
     resume_ckpt = resolve_resume_checkpoint(args_cli.resume)
     if resume_ckpt:
         if os.path.exists(resume_ckpt):
             print(f"[INFO] Loading skrl agent checkpoint: {resume_ckpt}")
             agent.load(resume_ckpt)
+
+            metadata_path = resolve_resume_metadata(args_cli.resume)
+            if metadata_path and float(args_cli.start_k) <= 0.0:
+                try:
+                    metadata = torch.load(metadata_path, map_location="cpu")
+                    restored_steps = int(metadata.get("global_steps", metadata.get("env_steps", 0)))
+                    if restored_steps > 0 and int(args_cli.force_stage) < 0:
+                        initial_global_steps = restored_steps
+                        base_env.global_steps = restored_steps
+                        base_env.reset()
+                        print(f"[INFO] Restored Task2 curriculum/global steps from metadata: {restored_steps:,}")
+                except Exception as exc:
+                    print(f"[WARN] failed to restore task2_train_metadata.pt: {type(exc).__name__}: {exc}")
+            elif resume_ckpt and not metadata_path:
+                print("[WARN] resume metadata not found; curriculum uses --start-k / current default global_steps")
         else:
             print(f"[WARN] resume checkpoint not found: {resume_ckpt}")
 
-    total_env_steps = int(args_cli.total_env_steps)
-    total_vector_steps = math.ceil(total_env_steps / int(num_envs))
+    train_env_steps_total = int(args_cli.total_env_steps)
+    display_global_steps_total = int(initial_global_steps) + int(train_env_steps_total)
+    total_vector_steps = math.ceil(train_env_steps_total / int(num_envs))
     save_freq_env_steps = int(args_cli.save_freq_env_steps)
     update_env_steps = int(cfg["rollouts"]) * int(num_envs)
 
@@ -759,17 +1084,24 @@ def main() -> None:
 
     print("\n[INFO] skrl PPO configuration")
     print(f"  - num_envs              : {num_envs:,}")
-    print(f"  - total_env_steps       : {total_env_steps:,}")
+    print(f"  - train_env_steps       : {train_env_steps_total:,}  # 本次新增训练步数")
+    print(f"  - initial_global_steps  : {initial_global_steps:,}")
+    print(f"  - final_global_steps    : {display_global_steps_total:,}")
     print(f"  - total_vector_steps    : {total_vector_steps:,}")
     print(f"  - update_env_steps      : {update_env_steps:,}")
     print(f"  - save_freq_env_steps   : {save_freq_env_steps:,}")
     print(f"  - start_k               : {args_cli.start_k:.4f}")
+    print(f"  - force_stage           : {args_cli.force_stage}")
     print(f"  - curriculum_total_steps: {env_cfg.world_cfg.curriculum_total_steps:,}")
     print(f"  - single_obs_dim        : {env_cfg.single_obs_dim}")
     print(f"  - frame_stack           : {env_cfg.frame_stack}")
     print(f"  - actor_obs_dim         : {env.observation_space.shape[0]}")
     print(f"  - critic_obs_dim        : {env.state_space.shape[0]}")
     print(f"  - action_dim            : {env.action_space.shape[0]}")
+    print(f"  - action_protocol       : {env_cfg.action_protocol}")
+    print(f"  - obs_protocol          : {env_cfg.obs_protocol}")
+    print(f"  - model_protocol        : {env_cfg.model_protocol}")
+    print(f"  - task1_core_checkpoint : {args_cli.task1_core_checkpoint or '<none>'}")
     print(f"  - lidar_rays            : {env_cfg.world_cfg.num_lidar_rays}")
     print(f"  - max_static_obs        : {env_cfg.world_cfg.max_static_obs}")
     print(f"  - max_dynamic_obs       : {env_cfg.world_cfg.max_dynamic_obs}")
@@ -780,24 +1112,37 @@ def main() -> None:
     print(f"  - lr                    : {cfg.get('learning_rate')}")
     print(f"  - tensorboard           : tensorboard --logdir={log_dir}")
 
-    print("\n🔥 [Diff-Drive Task2 TRUE skrl PPO 已点火]")
+    print("\n🔥 [Diff-Drive Task2 skrl PPO 已点火]")
     print("👉 任务目标：两轮差速无人车在解析障碍世界中导航到目标点")
-    print("👉 Actor/Critic 输入：3 帧堆叠观测，498 维")
-    print("👉 动作：2 维左右轮速度控制")
+    print("👉 Actor/Critic 输入：3 帧堆叠观测，498 维，其中每帧前 14 维为 core navigation")
+    print("👉 动作：2 维 [forward_throttle, turn]，Stage0/1 带最小正向速度约束，环境内部转换为左右轮速度，线速度命令非负")
     print("👉 世界层：analytic GPU world + LiDAR + risk features")
     print("👉 日志重点：Progress / Goal_Aligned_Speed / Goal_Dist / Success_Rate / Collision_Rate / Stuck_Ratio\n")
 
     last_save = 0
     update_id = 0
     start_time = time.time()
-    env_steps = int(initial_global_steps)
+    best_checkpoints_enabled = not bool(getattr(args_cli, "disable_best_checkpoints", False))
+    best_min_interval = max(int(getattr(args_cli, "best_checkpoint_min_interval_env_steps", 500_000)), int(num_envs))
+    best_scores = {"balanced": -1e9, "efficiency": -1e9, "success": -1e9}
+    best_last_save_steps = {"balanced": -10**18, "efficiency": -10**18, "success": -10**18}
+    stage_pass_counter = 0
+    stage_pass_saved = False
+    train_env_steps_done = 0
+    display_global_steps = int(initial_global_steps)
+    env_steps = display_global_steps
+    prev_policy_vec = model_param_vector(models["policy"])
+    prev_value_vec = model_param_vector(models["value"])
+    prev_summary_policy_vec = prev_policy_vec.clone()
+    prev_summary_value_vec = prev_value_vec.clone()
+    ppo_summary_buffer = []
 
     try:
         trainer.reset()
 
         with tqdm(
-            total=total_env_steps,
-            initial=min(env_steps, total_env_steps),
+            total=train_env_steps_total,
+            initial=0,
             desc="Diff-Drive Task2 skrl PPO",
             unit="steps",
             dynamic_ncols=True,
@@ -807,9 +1152,11 @@ def main() -> None:
             for t in range(total_vector_steps):
                 trainer.train(timestep=t, timesteps=total_vector_steps)
 
-                env_steps = min(initial_global_steps + (t + 1) * int(num_envs), total_env_steps)
-                previous_env_steps = min(initial_global_steps + t * int(num_envs), total_env_steps)
-                pbar.update(max(env_steps - previous_env_steps, 0))
+                train_env_steps_done = min((t + 1) * int(num_envs), train_env_steps_total)
+                previous_train_env_steps = min(t * int(num_envs), train_env_steps_total)
+                display_global_steps = int(initial_global_steps) + int(train_env_steps_done)
+                env_steps = display_global_steps
+                pbar.update(max(train_env_steps_done - previous_train_env_steps, 0))
 
                 flat = flat_dict(local_env.last_info)
                 elapsed = time.time() - start_time
@@ -817,7 +1164,8 @@ def main() -> None:
 
                 pbar.set_postfix(
                     {
-                        "steps": f"{env_steps:,}",
+                        "global": f"{env_steps:,}",
+                        "train": f"{train_env_steps_done:,}",
                         "fps": f"{fps:,.0f}",
                         "rew": f"{local_env.last_reward_mean:+.3f}",
                         "done": local_env.last_done_count,
@@ -825,9 +1173,11 @@ def main() -> None:
                         "dist": f"{flat.get('telemetry/Goal_Dist', 0.0):.2f}",
                         "prog": f"{flat.get('telemetry/Progress', 0.0):+.3f}",
                         "goal_v": f"{flat.get('telemetry/Goal_Aligned_Speed', 0.0):+.2f}",
+                        "spd": f"{flat.get('telemetry/Speed_Ratio', 0.0):+.2f}",
+                        "stuck": f"{flat.get('telemetry/Stuck_Ratio', 0.0):.2f}",
                         "risk": f"{flat.get('telemetry/Risk_Front', 0.0):.2f}",
-                        "succ": f"{flat.get('events/Episode_Success_Rate', 0.0):.3f}",
-                        "coll": f"{flat.get('events/Episode_Collision_Rate', 0.0):.3f}",
+                        "succ": f"{flat.get('events/Current_Window_Success_Rate', 0.0):.3f}",
+                        "oob": f"{flat.get('events/Current_Window_Out_Of_Bounds_Rate', 0.0):.3f}",
                     }
                 )
 
@@ -852,15 +1202,164 @@ def main() -> None:
                     lr = current_lr(agent)
                     ppo_info["learning_rate"] = lr
 
+                    policy_vec = model_param_vector(models["policy"])
+                    value_vec = model_param_vector(models["value"])
+                    ppo_info["Policy / Param norm"] = float(torch.norm(policy_vec).item())
+                    ppo_info["Policy / Param delta update"] = float(torch.norm(policy_vec - prev_policy_vec).item())
+                    ppo_info["Policy / Param delta since summary"] = float(torch.norm(policy_vec - prev_summary_policy_vec).item())
+                    ppo_info["Value / Param norm"] = float(torch.norm(value_vec).item())
+                    ppo_info["Value / Param delta update"] = float(torch.norm(value_vec - prev_value_vec).item())
+                    ppo_info["Value / Param delta since summary"] = float(torch.norm(value_vec - prev_summary_value_vec).item())
+                    ppo_info["PPO / Tracking data keys"] = float(len(getattr(agent, "tracking_data", {}) or {}))
+
+                    try:
+                        with torch.no_grad():
+                            raw_action, _ = models["policy"].compute({"observations": local_env.last_obs}, role="policy")
+                            raw_action = torch.clamp(raw_action, -1.0, 1.0)
+                            speed_factor = 0.5 * (raw_action[:, 0] + 1.0)
+                            ppo_info["PolicyMeanDebug_NotExecuted / MeanForward"] = float(raw_action[:, 0].mean().item())
+                            ppo_info["PolicyMeanDebug_NotExecuted / MeanTurn"] = float(raw_action[:, 1].mean().item())
+                            ppo_info["PolicyMeanDebug_NotExecuted / MeanSpeedFactor"] = float(speed_factor.mean().item())
+                            ppo_info["PolicyMeanDebug_NotExecuted / ForwardPositiveRatio"] = float((speed_factor > 1e-4).float().mean().item())
+
+                            # 真正执行到环境里的动作以 telemetry 为准，避免 raw actor debug 误导判断。
+                            ppo_info["ExecutedAction / ForwardThrottleMean"] = float(flat.get("telemetry/Action_Forward_Throttle", 0.0))
+                            ppo_info["ExecutedAction / SpeedFactorMean"] = float(flat.get("telemetry/Speed_Factor", 0.0))
+                            ppo_info["ExecutedAction / ForwardCommandNormMean"] = float(flat.get("telemetry/Forward_Command_Norm", 0.0))
+                            ppo_info["ExecutedAction / TurnMean"] = float(flat.get("telemetry/Action_Turn", 0.0))
+                            ppo_info["ExecutedAction / TurnCommandNormMean"] = float(flat.get("telemetry/Turn_Command_Norm", 0.0))
+                            ppo_info["ExecutedAction / TurnToGoalAlignmentMean"] = float(flat.get("telemetry/Turn_To_Goal_Alignment", 0.0))
+                            ppo_info["ExecutedAction / CorrectTurnRatio"] = float(flat.get("telemetry/Correct_Turn_Ratio", 0.0))
+                            ppo_info["ExecutedAction / LeftWheelTargetNormMean"] = float(flat.get("telemetry/Left_Wheel_Target_Norm", 0.0))
+                            ppo_info["ExecutedAction / RightWheelTargetNormMean"] = float(flat.get("telemetry/Right_Wheel_Target_Norm", 0.0))
+                    except Exception:
+                        pass
+
+                    prev_policy_vec = policy_vec
+                    prev_value_vec = value_vec
+
+                    score_info = compute_balanced_score(env_cfg, flat)
+                    ppo_info["CheckpointSelection / BalancedScore"] = score_info["balanced_score"]
+                    ppo_info["CheckpointSelection / EfficiencyScore"] = score_info["efficiency_score"]
+                    ppo_info["CheckpointSelection / SuccessScore"] = score_info["success_score"]
+                    ppo_info["CheckpointSelection / Stage"] = score_info["stage"]
+                    ppo_info["CheckpointSelection / StagePassed"] = 1.0 if stage_passed(env_cfg, flat) else 0.0
+
+                    ppo_summary_buffer.append(dict(ppo_info))
                     write_scalars(writer, ppo_info, env_steps, "ppo")
                     write_scalars(writer, flat, env_steps, "env_info")
 
+                    if best_checkpoints_enabled:
+                        best_targets = [
+                            ("balanced", score_info["balanced_score"], "best_balanced_checkpoint"),
+                            ("efficiency", score_info["efficiency_score"], "best_efficiency_checkpoint"),
+                            ("success", score_info["success_score"], "best_success_checkpoint"),
+                        ]
+                        for metric_name, score_value, dirname in best_targets:
+                            if (
+                                score_value > best_scores[metric_name]
+                                and env_steps - best_last_save_steps[metric_name] >= best_min_interval
+                            ):
+                                best_scores[metric_name] = float(score_value)
+                                best_last_save_steps[metric_name] = int(env_steps)
+                                best_dir = os.path.join(log_dir, run_name, dirname)
+                                try:
+                                    save_project_checkpoint(
+                                        best_dir,
+                                        agent=agent,
+                                        models=models,
+                                        env_cfg=env_cfg,
+                                        env=local_env,
+                                        env_steps=env_steps,
+                                        args=args_cli,
+                                    )
+                                    torch.save(
+                                        {
+                                            "metric_name": metric_name,
+                                            "score": float(score_value),
+                                            "score_info": score_info,
+                                            "flat_metrics": flat,
+                                            "env_steps": int(env_steps),
+                                        },
+                                        os.path.join(best_dir, "checkpoint_selection.pt"),
+                                    )
+                                    pbar.write(
+                                        f"\n🏆 [Task2 {metric_name} checkpoint] score={score_value:.6f} | "
+                                        f"stage={score_info['stage']:.0f} | saved to: {best_dir}\n"
+                                    )
+                                except Exception as exc:
+                                    pbar.write(f"\n[WARN] best checkpoint 保存失败: {type(exc).__name__}: {exc}\n")
+
+                    if stage_passed(env_cfg, flat):
+                        stage_pass_counter += 1
+                    else:
+                        stage_pass_counter = 0
+
+                    if (
+                        best_checkpoints_enabled
+                        and (not stage_pass_saved)
+                        and stage_pass_counter >= max(int(getattr(args_cli, "stage_pass_patience", 3)), 1)
+                    ):
+                        pass_dir = os.path.join(log_dir, run_name, "stage_pass_checkpoint")
+                        try:
+                            save_project_checkpoint(
+                                pass_dir,
+                                agent=agent,
+                                models=models,
+                                env_cfg=env_cfg,
+                                env=local_env,
+                                env_steps=env_steps,
+                                args=args_cli,
+                            )
+                            torch.save(
+                                {
+                                    "score_info": score_info,
+                                    "flat_metrics": flat,
+                                    "env_steps": int(env_steps),
+                                    "pass_patience": int(getattr(args_cli, "stage_pass_patience", 3)),
+                                },
+                                os.path.join(pass_dir, "stage_pass_metrics.pt"),
+                            )
+                            stage_pass_saved = True
+                            pbar.write(
+                                f"\n✅ [Task2 stage pass] stage={score_info['stage']:.0f} | "
+                                f"patience={stage_pass_counter} | checkpoint: {pass_dir}\n"
+                            )
+                            if bool(getattr(args_cli, "stage_pass_early_stop", False)):
+                                pbar.write("\n🛑 stage_pass_early_stop enabled: stopping current stage training.\n")
+                                break
+                        except Exception as exc:
+                            pbar.write(f"\n[WARN] stage pass checkpoint 保存失败: {type(exc).__name__}: {exc}\n")
+
                     if update_id % max(int(args_cli.summary_interval), 1) == 0:
+                        if ppo_summary_buffer:
+                            keys = sorted(set().union(*[d.keys() for d in ppo_summary_buffer]))
+                            summary_ppo_info = {}
+                            for key in keys:
+                                values = [d[key] for d in ppo_summary_buffer if key in d and math.isfinite(float(d[key]))]
+                                if values:
+                                    summary_ppo_info[key] = float(np.mean(values))
+                            # These two are more useful as latest values rather than averages.
+                            for key in [
+                                "Policy / Param norm",
+                                "Value / Param norm",
+                                "Policy / Param delta since summary",
+                                "Value / Param delta since summary",
+                                "learning_rate",
+                            ]:
+                                if key in ppo_info:
+                                    summary_ppo_info[key] = ppo_info[key]
+                            ppo_info_to_print = summary_ppo_info
+                        else:
+                            ppo_info_to_print = ppo_info
                         stat = {
                             "update": float(update_id),
-                            "env_steps": float(env_steps),
-                            "total_env_steps": float(total_env_steps),
-                            "progress_percent": 100.0 * env_steps / max(total_env_steps, 1),
+                            "global_env_steps": float(env_steps),
+                            "initial_global_steps": float(initial_global_steps),
+                            "train_env_steps": float(train_env_steps_done),
+                            "train_env_steps_total": float(train_env_steps_total),
+                            "display_global_steps_total": float(display_global_steps_total),
+                            "progress_percent": 100.0 * train_env_steps_done / max(train_env_steps_total, 1),
                             "num_envs": float(num_envs),
                             "rollouts_per_update": float(cfg["rollouts"]),
                             "fps": float(fps),
@@ -872,24 +1371,28 @@ def main() -> None:
                                 [
                                     "\n" + "=" * 118,
                                     f"📊 [Diff-Drive Task2 skrl PPO 更新 {update_id}] "
-                                    f"总步数: {env_steps:,} / {total_env_steps:,} | "
+                                    f"本次训练: {train_env_steps_done:,} / {train_env_steps_total:,} | "
+                                    f"全局步数: {env_steps:,} / {display_global_steps_total:,} | "
                                     f"FPS: {fps:,.0f} | LR: {lr:.3e}",
                                     "=" * 118,
                                     make_table("time / progress", stat),
                                     make_table("env info: rewards + events + telemetry + world + debug", flat),
-                                    make_table("ppo update info", ppo_info),
+                                    make_table("ppo update info", ppo_info_to_print),
                                     "=" * 118 + "\n",
                                 ]
                             )
                         )
+                        prev_summary_policy_vec = policy_vec.clone()
+                        prev_summary_value_vec = value_vec.clone()
+                        ppo_summary_buffer.clear()
 
                     try:
                         agent.tracking_data.clear()
                     except Exception:
                         pass
 
-                if env_steps - last_save >= save_freq_env_steps:
-                    last_save = env_steps
+                if train_env_steps_done - last_save >= save_freq_env_steps:
+                    last_save = train_env_steps_done
                     save_dir = os.path.join(log_dir, run_name, f"checkpoint_{env_steps}")
 
                     try:
@@ -942,7 +1445,7 @@ def main() -> None:
         except Exception:
             pass
 
-        print("✅ Diff-Drive Task2 TRUE skrl PPO training pipeline safely exited")
+        print("✅ Diff-Drive Task2 skrl PPO training pipeline safely exited")
 
 
 if __name__ == "__main__":

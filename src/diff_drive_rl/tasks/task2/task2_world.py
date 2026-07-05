@@ -9,7 +9,7 @@ import torch
 
 @dataclass
 class Task2WorldConfig:
-    """Jetbot Task2 analytic GPU navigation world.
+    """Analytic GPU navigation world for a differential-drive robot.
 
     Coordinate convention:
         All positions in this file are env-local xy coordinates.
@@ -43,6 +43,44 @@ class Task2WorldConfig:
     start_goal_safe_radius: float = 1.25
     max_sampling_attempts: int = 80
 
+    # Minimum boundary-to-boundary gap reserved between obstacle discs. This
+    # should be larger than the robot diameter plus a small clearance, so dense
+    # stages remain traversable instead of forming accidental dead ends.
+    min_passage_width: float = 1.45
+
+    # Minimum signed distance from any static obstacle disc to the nominal
+    # start-goal segment. Negative values allow a small corridor intrusion,
+    # but prevent static obstacles from being sampled directly on top of the
+    # nominal path. This keeps early stages traversable and prevents random
+    # global samples from accidentally creating a blocked corridor.
+    min_static_path_signed_distance: float = -0.25
+
+    # Corridor-aware obstacle placement. A ratio of static / dynamic obstacles
+    # is sampled near the start-goal corridor so obstacle stages create real
+    # avoidance pressure. The remaining obstacles are still globally sampled for
+    # spatial diversity.
+    static_corridor_ratio_by_stage: Tuple[float, ...] = (0.0, 0.20, 0.35, 0.55, 0.55, 0.45)
+    dynamic_corridor_ratio_by_stage: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.55, 0.60)
+    corridor_longitudinal_range: Tuple[float, float] = (0.25, 0.82)
+    # Legacy fallback used if per-stage lateral ranges are not provided.
+    corridor_lateral_offset_range: Tuple[float, float] = (1.55, 2.60)
+    corridor_lateral_offset_ranges_by_stage: Tuple[Tuple[float, float], ...] = (
+        (2.2, 3.2),
+        (1.8, 2.8),
+        (1.55, 2.60),
+        (1.1, 2.1),
+        (0.9, 1.9),
+        (0.8, 1.8),
+    )
+    dynamic_crossing_lateral_range: Tuple[float, float] = (2.8, 4.6)
+    dynamic_speed_target_ratio: float = 0.58
+
+    # Minimum number of active static obstacles that must be sampled near the
+    # start-goal corridor in each curriculum stage. This keeps early obstacle
+    # stages meaningful while preserving globally distributed obstacles for
+    # later stages.
+    min_corridor_static_by_stage: Tuple[int, ...] = (0, 0, 1, 1, 1, 2)
+
     # ------------------------------------------------------------------
     # Curriculum
     # ------------------------------------------------------------------
@@ -50,74 +88,74 @@ class Task2WorldConfig:
 
     stage_thresholds: Tuple[float, ...] = (
         0.0,
-        0.08,
-        0.20,
-        0.38,
-        0.60,
-        0.80,
+        0.12,
+        0.28,
+        0.46,
+        0.68,
+        0.86,
     )
 
     goal_dist_ranges: Tuple[Tuple[float, float], ...] = (
-        (3.0, 6.0),
-        (5.0, 10.0),
-        (8.0, 15.0),
-        (10.0, 20.0),
-        (15.0, 30.0),
-        (20.0, 42.0),
+        (4.0, 7.0),
+        (4.0, 7.0),
+        (4.5, 7.5),
+        (5.5, 9.5),
+        (7.0, 12.0),
+        (10.0, 18.0),
     )
 
     static_count_ranges: Tuple[Tuple[int, int], ...] = (
         (0, 0),
-        (3, 5),
-        (6, 10),
-        (10, 15),
-        (14, 20),
-        (18, 20),
+        (0, 1),
+        (1, 1),
+        (2, 4),
+        (3, 6),
+        (5, 10),
     )
 
     dynamic_count_ranges: Tuple[Tuple[int, int], ...] = (
         (0, 0),
         (0, 0),
         (0, 0),
+        (0, 0),
         (1, 2),
         (2, 4),
-        (3, 5),
     )
 
     target_speed_ranges: Tuple[Tuple[float, float], ...] = (
-        (0.35, 0.65),
-        (0.40, 0.75),
-        (0.45, 0.90),
-        (0.50, 1.00),
-        (0.55, 1.15),
-        (0.60, 1.25),
+        (0.42, 0.58),
+        (0.42, 0.60),
+        (0.42, 0.65),
+        (0.44, 0.72),
+        (0.46, 0.80),
+        (0.50, 0.90),
     )
 
     static_radius_ranges: Tuple[Tuple[float, float], ...] = (
         (0.35, 0.60),
-        (0.35, 0.80),
-        (0.40, 1.00),
-        (0.45, 1.15),
-        (0.50, 1.30),
-        (0.50, 1.50),
+        (0.30, 0.55),
+        (0.35, 0.65),
+        (0.38, 0.85),
+        (0.42, 0.95),
+        (0.45, 1.10),
     )
 
     dynamic_radius_ranges: Tuple[Tuple[float, float], ...] = (
         (0.30, 0.45),
         (0.30, 0.45),
+        (0.30, 0.50),
         (0.30, 0.55),
         (0.35, 0.65),
         (0.40, 0.75),
-        (0.45, 0.85),
     )
 
     dynamic_speed_ranges: Tuple[Tuple[float, float], ...] = (
         (0.0, 0.0),
         (0.0, 0.0),
         (0.0, 0.0),
-        (0.20, 0.45),
-        (0.25, 0.60),
-        (0.30, 0.75),
+        (0.0, 0.0),
+        (0.16, 0.34),
+        (0.18, 0.45),
     )
 
     # ------------------------------------------------------------------
@@ -168,6 +206,22 @@ class Task2WorldConfig:
         assert self.min_obs_spacing >= 0.0
         assert self.start_goal_safe_radius > 0.0
         assert self.max_sampling_attempts > 0
+        assert self.min_passage_width > 2.0 * self.robot_radius
+        assert self.min_static_path_signed_distance > -float(self.robot_radius) - 1.0
+
+        assert len(self.static_corridor_ratio_by_stage) == self.num_stages
+        assert len(self.dynamic_corridor_ratio_by_stage) == self.num_stages
+        assert len(self.min_corridor_static_by_stage) == self.num_stages
+        assert len(self.corridor_lateral_offset_ranges_by_stage) == self.num_stages
+        assert all(0 <= int(x) <= self.max_static_obs for x in self.min_corridor_static_by_stage)
+        assert all(0.0 <= float(x) <= 1.0 for x in self.static_corridor_ratio_by_stage)
+        assert all(0.0 <= float(x) <= 1.0 for x in self.dynamic_corridor_ratio_by_stage)
+        assert 0.0 <= self.corridor_longitudinal_range[0] <= self.corridor_longitudinal_range[1] <= 1.0
+        assert 0.0 < self.corridor_lateral_offset_range[0] <= self.corridor_lateral_offset_range[1]
+        for lo, hi in self.corridor_lateral_offset_ranges_by_stage:
+            assert 0.0 < float(lo) <= float(hi)
+        assert 0.0 < self.dynamic_crossing_lateral_range[0] <= self.dynamic_crossing_lateral_range[1]
+        assert 0.0 < self.dynamic_speed_target_ratio < 1.0
 
         assert self.curriculum_total_steps > 0
         assert len(self.stage_thresholds) >= 1
@@ -227,7 +281,7 @@ class Task2WorldConfig:
 
 
 class Task2WorldManager:
-    """Pure analytic GPU world manager for Jetbot Task2.
+    """Pure analytic GPU world manager for obstacle-navigation tasks.
 
     All tensors live on cfg.device selected by the caller.
     No Isaac prims are created here.
@@ -425,6 +479,110 @@ class Task2WorldManager:
         self.goal_distance[env_ids] = d
         self.env_target_speed[env_ids] = self._sample_stage_float(self.cfg.target_speed_ranges, stages)
 
+    def _static_path_signed_for_candidates(
+        self,
+        env_ids: torch.Tensor,
+        local_ids: torch.Tensor,
+        candidate_pos: torch.Tensor,
+        radius: torch.Tensor,
+    ) -> torch.Tensor:
+        """Signed distance from candidate static discs to the start-goal segment.
+
+        Positive values mean the candidate disc, including robot collision
+        clearance, is away from the nominal path. Small negative values are
+        allowed by configuration for later stages, but strongly negative values
+        would place an obstacle directly on the path and can create accidental
+        dead ends.
+        """
+
+        start = self.start_pos[env_ids[local_ids]]
+        goal = self.goal_pos[env_ids[local_ids]]
+        path = goal - start
+        path_len_sq = torch.clamp(torch.sum(path * path, dim=-1), min=1e-6)
+
+        rel = candidate_pos - start
+        t = torch.sum(rel * path, dim=-1) / path_len_sq
+        t = torch.clamp(t, 0.0, 1.0)
+        closest = start + t.unsqueeze(-1) * path
+
+        dist = torch.norm(candidate_pos - closest, dim=-1)
+        signed = dist - (
+            radius + float(self.cfg.robot_radius) + float(self.cfg.collision_margin)
+        )
+        return signed
+
+    def _sample_corridor_candidate(
+        self,
+        env_ids: torch.Tensor,
+        local_ids: torch.Tensor,
+        radius: torch.Tensor,
+        dynamic: bool = False,
+    ) -> torch.Tensor:
+        """Sample candidate points near the start-goal corridor.
+
+        Static obstacles are placed to the side of the nominal path so they
+        create LiDAR/risk pressure without fully blocking the corridor. Dynamic
+        obstacles are initialized farther from the corridor and later assigned a
+        crossing velocity that intersects the start-goal line.
+        """
+
+        start = self.start_pos[env_ids[local_ids]]
+        goal = self.goal_pos[env_ids[local_ids]]
+        path = goal - start
+        path_len = torch.clamp(torch.norm(path, dim=-1, keepdim=True), min=1e-6)
+        unit = path / path_len
+        normal = torch.stack([-unit[:, 1], unit[:, 0]], dim=-1)
+
+        t_min, t_max = self.cfg.corridor_longitudinal_range
+        t = float(t_min) + torch.rand((int(local_ids.numel()), 1), dtype=torch.float32, device=self.device) * (
+            float(t_max) - float(t_min)
+        )
+        center = start + t * path
+
+        if dynamic:
+            lat_min, lat_max = self.cfg.dynamic_crossing_lateral_range
+            lat_min_t = torch.full_like(radius, float(lat_min))
+            lat_max_t = torch.full_like(radius, float(lat_max))
+        else:
+            # Static corridor width is stage-dependent. Stage1 uses a weak, far
+            # transition layout; Stage2 introduces the first light corridor
+            # obstacle; later stages gradually move obstacles closer and denser.
+            stage_ids = self.env_stage[env_ids[local_ids]].long()
+            lateral_ranges = torch.tensor(
+                self.cfg.corridor_lateral_offset_ranges_by_stage,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            lat_min_t = lateral_ranges[stage_ids, 0]
+            lat_max_t = lateral_ranges[stage_ids, 1]
+
+        # Keep the obstacle disc outside the nominal center line by at least a
+        # robot-radius clearance. This prevents early stages from becoming
+        # blocked corridors while still exposing the policy to nearby obstacles.
+        lateral_min = torch.clamp(
+            lat_min_t,
+            min=radius + float(self.cfg.robot_radius) + 0.15,
+        )
+        lateral_max = torch.clamp(lat_max_t, min=lateral_min + 0.05)
+        lateral_abs = lateral_min + torch.rand_like(radius) * (lateral_max - lateral_min)
+        sign = torch.where(
+            torch.rand_like(radius) < 0.5,
+            torch.full_like(radius, -1.0),
+            torch.full_like(radius, 1.0),
+        )
+        return center + normal * (sign * lateral_abs).unsqueeze(-1)
+
+    def _sample_global_candidate(self, count: int, radius: torch.Tensor) -> torch.Tensor:
+        half = float(self.cfg.half_extent)
+        bound = torch.clamp(
+            half - radius - float(self.cfg.robot_radius) - 0.10,
+            min=0.50,
+        )
+        cand = torch.empty((int(count), 2), dtype=torch.float32, device=self.device)
+        cand[:, 0] = (torch.rand(int(count), dtype=torch.float32, device=self.device) * 2.0 - 1.0) * bound
+        cand[:, 1] = (torch.rand(int(count), dtype=torch.float32, device=self.device) * 2.0 - 1.0) * bound
+        return cand
+
     def _sample_obstacle_layout(self, env_ids: torch.Tensor, stages: torch.Tensor) -> None:
         n = int(env_ids.numel())
         max_static = int(self.cfg.max_static_obs)
@@ -462,6 +620,9 @@ class Task2WorldManager:
         combined_pos = torch.zeros((n, total, 2), dtype=torch.float32, device=self.device)
 
         half = float(self.cfg.half_extent)
+        static_ratio_table = torch.tensor(self.cfg.static_corridor_ratio_by_stage, dtype=torch.float32, device=self.device)
+        dynamic_ratio_table = torch.tensor(self.cfg.dynamic_corridor_ratio_by_stage, dtype=torch.float32, device=self.device)
+        min_corridor_static_table = torch.tensor(self.cfg.min_corridor_static_by_stage, dtype=torch.long, device=self.device)
 
         for i in range(total):
             active = combined_mask[:, i]
@@ -470,6 +631,7 @@ class Task2WorldManager:
 
             valid = ~active
             radius_i = combined_radius[:, i]
+            is_dynamic_slot = i >= max_static
 
             for _ in range(int(self.cfg.max_sampling_attempts)):
                 invalid = (~valid).nonzero(as_tuple=False).squeeze(-1)
@@ -477,14 +639,32 @@ class Task2WorldManager:
                     break
 
                 r = radius_i[invalid]
-                bound = torch.clamp(
-                    half - r - float(self.cfg.robot_radius) - 0.10,
-                    min=0.50,
-                )
+                stage_i = stages[invalid]
+                ratio = dynamic_ratio_table[stage_i] if is_dynamic_slot else static_ratio_table[stage_i]
+                use_corridor = torch.rand(int(invalid.numel()), dtype=torch.float32, device=self.device) < ratio
+                if not is_dynamic_slot:
+                    # Ensure that early obstacle stages contain at least one
+                    # corridor-relevant static obstacle when static obstacles
+                    # are active. This avoids degenerate resets where all
+                    # static obstacles are far from the start-goal path.
+                    min_corridor = min_corridor_static_table[stage_i]
+                    force_corridor = torch.full_like(use_corridor, bool(i == 0)) & (min_corridor > 0)
+                    # For denser stages, the first few static slots are forced
+                    # into the corridor according to the stage table.
+                    force_corridor = force_corridor | (torch.full_like(min_corridor, int(i)) < min_corridor)
+                    use_corridor = use_corridor | force_corridor
 
-                cand = torch.empty((int(invalid.numel()), 2), dtype=torch.float32, device=self.device)
-                cand[:, 0] = (torch.rand(int(invalid.numel()), dtype=torch.float32, device=self.device) * 2.0 - 1.0) * bound
-                cand[:, 1] = (torch.rand(int(invalid.numel()), dtype=torch.float32, device=self.device) * 2.0 - 1.0) * bound
+                cand_global = self._sample_global_candidate(int(invalid.numel()), r)
+                cand_corridor = self._sample_corridor_candidate(
+                    env_ids=env_ids,
+                    local_ids=invalid,
+                    radius=r,
+                    dynamic=bool(is_dynamic_slot),
+                )
+                cand = torch.where(use_corridor.unsqueeze(-1), cand_corridor, cand_global)
+
+                bound = torch.clamp(half - r - float(self.cfg.robot_radius) - 0.10, min=0.50)
+                inside = (cand[:, 0].abs() <= bound) & (cand[:, 1].abs() <= bound)
 
                 start = self.start_pos[env_ids[invalid]]
                 goal = self.goal_pos[env_ids[invalid]]
@@ -496,7 +676,23 @@ class Task2WorldManager:
                     float(self.cfg.start_goal_safe_radius) + float(self.cfg.robot_radius) + r
                 )
 
-                ok = safe_start & safe_goal
+                ok = inside & safe_start & safe_goal
+
+                if not is_dynamic_slot:
+                    # Global static samples can accidentally land directly on
+                    # the nominal start-goal path. Keep every static obstacle
+                    # disc above a configurable signed corridor clearance, so
+                    # Stage1/2 remain traversable and the world-test path
+                    # corridor metric is meaningful. Corridor samples already
+                    # satisfy this by construction; this guard mainly protects
+                    # random global samples and dense-stage fallbacks.
+                    path_signed = self._static_path_signed_for_candidates(
+                        env_ids=env_ids,
+                        local_ids=invalid,
+                        candidate_pos=cand,
+                        radius=r,
+                    )
+                    ok = ok & (path_signed > float(self.cfg.min_static_path_signed_distance))
 
                 if i > 0:
                     prev_pos = combined_pos[invalid, :i, :]
@@ -504,7 +700,7 @@ class Task2WorldManager:
                     prev_mask = combined_mask[invalid, :i]
 
                     dist_prev = torch.norm(cand.unsqueeze(1) - prev_pos, dim=-1)
-                    required = r.unsqueeze(-1) + prev_rad + float(self.cfg.min_obs_spacing) + float(self.cfg.robot_radius)
+                    required = r.unsqueeze(-1) + prev_rad + float(self.cfg.min_passage_width)
 
                     sep_ok = torch.where(
                         prev_mask,
@@ -520,14 +716,58 @@ class Task2WorldManager:
 
             remaining = (~valid).nonzero(as_tuple=False).squeeze(-1)
             if remaining.numel() > 0:
-                # Fallback should be rare. It keeps tensors finite and inside arena.
-                angle = torch.rand(int(remaining.numel()), dtype=torch.float32, device=self.device) * 2.0 * math.pi
-                r_fallback = torch.clamp(
-                    half * 0.50 + torch.rand(int(remaining.numel()), dtype=torch.float32, device=self.device) * half * 0.35,
-                    max=half - 1.0,
-                )
-                combined_pos[remaining, i, 0] = r_fallback * torch.cos(angle)
-                combined_pos[remaining, i, 1] = r_fallback * torch.sin(angle)
+                # Fallback remains inside the arena. For static obstacles it is
+                # additionally kept away from the nominal path, otherwise a
+                # dense-stage fallback can silently create a blocked corridor.
+                r = radius_i[remaining]
+                fallback_valid = torch.zeros(int(remaining.numel()), dtype=torch.bool, device=self.device)
+                fallback_pos = torch.zeros((int(remaining.numel()), 2), dtype=torch.float32, device=self.device)
+
+                for _ in range(int(self.cfg.max_sampling_attempts)):
+                    todo = (~fallback_valid).nonzero(as_tuple=False).squeeze(-1)
+                    if todo.numel() == 0:
+                        break
+
+                    r_todo = r[todo]
+                    rem_todo = remaining[todo]
+                    angle = torch.rand(int(todo.numel()), dtype=torch.float32, device=self.device) * 2.0 * math.pi
+                    r_fallback = torch.clamp(
+                        half * 0.55 + torch.rand(int(todo.numel()), dtype=torch.float32, device=self.device) * half * 0.30,
+                        max=half - r_todo - float(self.cfg.robot_radius) - 0.10,
+                    )
+                    cand = torch.stack([r_fallback * torch.cos(angle), r_fallback * torch.sin(angle)], dim=-1)
+
+                    ok = torch.ones(int(todo.numel()), dtype=torch.bool, device=self.device)
+                    if not is_dynamic_slot:
+                        path_signed = self._static_path_signed_for_candidates(
+                            env_ids=env_ids,
+                            local_ids=rem_todo,
+                            candidate_pos=cand,
+                            radius=r_todo,
+                        )
+                        ok = ok & (path_signed > float(self.cfg.min_static_path_signed_distance))
+
+                    if ok.any():
+                        good_todo = todo[ok]
+                        fallback_pos[good_todo] = cand[ok]
+                        fallback_valid[good_todo] = True
+
+                # If the strict fallback still fails, use the last generated
+                # arena-safe position rather than leaving zeros. This path is
+                # rare and only affects extremely dense layouts; the main
+                # sampling loop above should normally succeed.
+                if (~fallback_valid).any():
+                    todo = (~fallback_valid).nonzero(as_tuple=False).squeeze(-1)
+                    r_todo = r[todo]
+                    angle = torch.rand(int(todo.numel()), dtype=torch.float32, device=self.device) * 2.0 * math.pi
+                    r_fallback = torch.clamp(
+                        half * 0.70 + torch.rand(int(todo.numel()), dtype=torch.float32, device=self.device) * half * 0.20,
+                        max=half - r_todo - float(self.cfg.robot_radius) - 0.10,
+                    )
+                    fallback_pos[todo, 0] = r_fallback * torch.cos(angle)
+                    fallback_pos[todo, 1] = r_fallback * torch.sin(angle)
+
+                combined_pos[remaining, i, :] = fallback_pos
 
         self.static_pos[env_ids] = combined_pos[:, :max_static, :]
         self.dynamic_pos[env_ids] = combined_pos[:, max_static:, :]
@@ -542,13 +782,40 @@ class Task2WorldManager:
         n = int(env_ids.numel())
         max_dynamic = int(self.cfg.max_dynamic_obs)
 
+        if max_dynamic <= 0:
+            return
+
         speed = self._sample_stage_float(self.cfg.dynamic_speed_ranges, stages).unsqueeze(-1)
-        angle = torch.rand((n, max_dynamic), dtype=torch.float32, device=self.device) * 2.0 * math.pi
+        target_speed = self.env_target_speed[env_ids].unsqueeze(-1)
+        speed = torch.minimum(speed, target_speed * float(self.cfg.dynamic_speed_target_ratio))
 
-        vel = torch.zeros((n, max_dynamic, 2), dtype=torch.float32, device=self.device)
-        vel[:, :, 0] = torch.cos(angle) * speed
-        vel[:, :, 1] = torch.sin(angle) * speed
+        start = self.start_pos[env_ids]
+        goal = self.goal_pos[env_ids]
+        path = goal - start
+        path_len = torch.clamp(torch.norm(path, dim=-1, keepdim=True), min=1e-6)
+        unit = path / path_len
+        normal = torch.stack([-unit[:, 1], unit[:, 0]], dim=-1)
 
+        dyn_pos = self.dynamic_pos[env_ids]
+        rel = dyn_pos - start.unsqueeze(1)
+        lateral = torch.sum(rel * normal.unsqueeze(1), dim=-1)
+
+        # Move primarily toward the start-goal line, with a small longitudinal
+        # component. The trajectory therefore intersects the corridor while
+        # remaining slower than the robot's expected target speed.
+        cross_dir = -torch.sign(lateral).unsqueeze(-1) * normal.unsqueeze(1)
+        random_long = (torch.rand((n, max_dynamic, 1), dtype=torch.float32, device=self.device) * 2.0 - 1.0) * 0.15
+        direction = cross_dir + random_long * unit.unsqueeze(1)
+        norm = torch.clamp(torch.norm(direction, dim=-1, keepdim=True), min=1e-6)
+        direction = direction / norm
+
+        random_angle = torch.rand((n, max_dynamic), dtype=torch.float32, device=self.device) * 2.0 * math.pi
+        random_dir = torch.stack([torch.cos(random_angle), torch.sin(random_angle)], dim=-1)
+        use_crossing = torch.tensor(self.cfg.dynamic_corridor_ratio_by_stage, dtype=torch.float32, device=self.device)[stages]
+        use_crossing = (torch.rand((n, max_dynamic), dtype=torch.float32, device=self.device) < use_crossing.unsqueeze(-1)).unsqueeze(-1)
+        direction = torch.where(use_crossing, direction, random_dir)
+
+        vel = direction * speed.unsqueeze(1)
         vel = torch.where(self.dynamic_mask[env_ids].unsqueeze(-1), vel, torch.zeros_like(vel))
         self.dynamic_vel[env_ids] = vel
 
@@ -879,6 +1146,36 @@ class Task2WorldManager:
             self.min_dynamic_signed_distance(root_pos_local),
         )
 
+    def static_path_corridor_signed_distance(self) -> torch.Tensor:
+        """Minimum signed distance from static obstacle discs to the start-goal segment.
+
+        This is a course-design diagnostic rather than a collision metric. It
+        measures how close static obstacles are to the nominal path, independent
+        of the robot's current trajectory. Positive values mean the obstacle
+        boundary, including robot clearance, is away from the nominal path; small
+        values indicate stronger corridor pressure.
+        """
+
+        if int(self.cfg.max_static_obs) <= 0:
+            return torch.full((self.num_envs,), 1e6, dtype=torch.float32, device=self.device)
+
+        start = self.start_pos
+        goal = self.goal_pos
+        path = goal - start
+        path_len_sq = torch.clamp(torch.sum(path * path, dim=-1), min=1e-6)
+
+        rel = self.static_pos - start[:, None, :]
+        t = torch.sum(rel * path[:, None, :], dim=-1) / path_len_sq[:, None]
+        t = torch.clamp(t, 0.0, 1.0)
+        closest = start[:, None, :] + t.unsqueeze(-1) * path[:, None, :]
+
+        dist = torch.norm(self.static_pos - closest, dim=-1)
+        signed = dist - (
+            self.static_radius + float(self.cfg.robot_radius) + float(self.cfg.collision_margin)
+        )
+        signed = torch.where(self.static_mask, signed, torch.full_like(signed, 1e6))
+        return signed.min(dim=-1)[0]
+
     def check_events(self, root_pos_local: torch.Tensor) -> Dict[str, torch.Tensor]:
         root_xy = root_pos_local[:, :2]
         goal_dist = torch.norm(self.goal_pos - root_xy, dim=-1)
@@ -946,8 +1243,24 @@ class Task2WorldManager:
             "dynamic_count": self.dynamic_mask.float().sum(dim=-1),
         }
 
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor, default: float = 0.0) -> torch.Tensor:
+        values = values.float()
+        mask = mask.bool()
+        if values.ndim > 1:
+            mask = mask.reshape(values.shape[0], *([1] * (values.ndim - 1)))
+        count = mask.float().sum()
+        if count.item() <= 0:
+            return torch.tensor(float(default), dtype=torch.float32, device=values.device)
+        return values[mask.expand_as(values)].mean()
+
     def get_debug_stats(self, root_pos_local: Optional[torch.Tensor] = None) -> Dict[str, float]:
         counts = self.get_counts()
+        static_present = counts["static_count"] > 0.5
+        dynamic_present = counts["dynamic_count"] > 0.5
+        any_obstacle_present = static_present | dynamic_present
+
+        static_path_signed = self.static_path_corridor_signed_distance()
 
         stats = {
             "Stage": self.env_stage.float().mean().item(),
@@ -955,21 +1268,33 @@ class Task2WorldManager:
             "Target_Speed_Mean": self.env_target_speed.mean().item(),
             "Static_Count": counts["static_count"].mean().item(),
             "Dynamic_Count": counts["dynamic_count"].mean().item(),
+            "Static_Present_Rate": static_present.float().mean().item(),
+            "Dynamic_Present_Rate": dynamic_present.float().mean().item(),
+            "Obstacle_Present_Rate": any_obstacle_present.float().mean().item(),
             "Static_Radius_Mean": self.static_radius[self.static_mask].mean().item() if self.static_mask.any() else 0.0,
             "Dynamic_Radius_Mean": self.dynamic_radius[self.dynamic_mask].mean().item() if self.dynamic_mask.any() else 0.0,
             "Lidar_Min": self.last_lidar_dist.min().item(),
             "Lidar_Mean": self.last_lidar_dist.mean().item(),
             "Risk_Front": self.last_risk_features[:, 1].mean().item(),
+            "Risk_Front_When_Static_Present": self._masked_mean(self.last_risk_features[:, 1], static_present).item(),
             "Risk_Dynamic": self.last_risk_features[:, 4].mean().item(),
             "Risk_Boundary": self.last_risk_features[:, 6].mean().item(),
+            "Path_Corridor_Signed_Distance": static_path_signed.mean().item(),
+            "Path_Corridor_Signed_Distance_When_Present": self._masked_mean(static_path_signed, static_present, 1e6).item(),
         }
 
         if root_pos_local is not None:
             event = self.check_events(root_pos_local)
+            min_static = event["min_static_signed_distance"]
+            min_dynamic = event["min_dynamic_signed_distance"]
+            min_obstacle = event["min_obstacle_signed_distance"]
             stats.update(
                 {
                     "Goal_Dist": event["goal_dist"].mean().item(),
-                    "Min_Obstacle_Signed_Distance": event["min_obstacle_signed_distance"].mean().item(),
+                    "Min_Obstacle_Signed_Distance": min_obstacle.mean().item(),
+                    "Min_Obstacle_Signed_Distance_When_Present": self._masked_mean(min_obstacle, any_obstacle_present, 1e6).item(),
+                    "Min_Static_Signed_Distance_When_Present": self._masked_mean(min_static, static_present, 1e6).item(),
+                    "Min_Dynamic_Signed_Distance_When_Present": self._masked_mean(min_dynamic, dynamic_present, 1e6).item(),
                     "Boundary_Margin": event["boundary_margin"].mean().item(),
                 }
             )
@@ -977,5 +1302,5 @@ class Task2WorldManager:
         return stats
 
 
-JetbotTask2WorldConfig = Task2WorldConfig
-JetbotTask2WorldManager = Task2WorldManager
+DiffDriveTask2WorldConfig = Task2WorldConfig
+DiffDriveTask2WorldManager = Task2WorldManager

@@ -10,12 +10,12 @@ from diff_drive_rl.tasks.task2.task2_config import Task2Config
 
 
 def make_diff_drive_task2_scene_cfg(cfg: Task2Config):
-    """Factory for Jetbot Task2 Isaac scene.
+    """Factory for a differential-drive Task2 Isaac scene.
 
     This scene contains:
         - ground plane
         - dome light
-        - Jetbot articulation
+        - differential-drive robot articulation
 
     It intentionally does not create obstacle prims. Static / dynamic obstacles,
     LiDAR, collision, and risk features are all computed analytically in
@@ -46,7 +46,7 @@ def make_diff_drive_task2_scene_cfg(cfg: Task2Config):
         robot: ArticulationCfg = ArticulationCfg(
             prim_path="{ENV_REGEX_NS}/Robot",
             spawn=sim_utils.UsdFileCfg(
-                usd_path=str(cfg.jetbot_usd_path),
+                usd_path=str(cfg.robot_usd_path),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     disable_gravity=False,
                     max_depenetration_velocity=10.0,
@@ -74,5 +74,4 @@ def make_diff_drive_task2_scene_cfg(cfg: Task2Config):
     return DiffDriveTask2SceneCfg
 
 
-JetbotTask2SceneCfgFactory = make_diff_drive_task2_scene_cfg
 DiffDriveTask2SceneCfgFactory = make_diff_drive_task2_scene_cfg
